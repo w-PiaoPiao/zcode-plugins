@@ -1,40 +1,41 @@
 #!/bin/bash
-# uninstall.sh — 卸载 ZCode 会话统计
+# uninstall.sh — 跨平台卸载 ZCode 会话统计
 set -euo pipefail
 
-ZCODE_DIR="${HOME}/.zcode"
-RUNTIME_DIR="${ZCODE_DIR}/session-stats"
-ASAR="/Applications/ZCode.app/Contents/Resources/app.asar"
-NODE_BIN="$(command -v node || true)"
-if [[ -z "$NODE_BIN" ]]; then
-  for cand in "$HOME/.local/bin/node" /opt/homebrew/bin/node /usr/local/bin/node; do
-    [[ -x "$cand" ]] && NODE_BIN="$cand" && break
-  done
-fi
-if [[ -z "$NODE_BIN" ]]; then
-  printf '\033[1;31m xx \033[0m 未找到 node，无法还原 app.asar 与清理配置；请先安装 Node.js 再卸载\n'
-  exit 1
-fi
+SRC_DIR="$(cd "$(dirname "$0")" && pwd)"
+source "$SRC_DIR/lib/zcenv.sh"
+zc_find_node
 
-log()  { printf '\033[1;32m==>\033[0m %s\n' "$*"; }
-
-# 1. 还原 app.asar
-if [[ -f "$ASAR.zcstats-orig" ]]; then
-  log "还原 app.asar"
-  "$NODE_BIN" "$(dirname "$0")/app-patch/patch-app.mjs" restore --asar "$ASAR" --purge
+# ---------- 1. 还原 app.asar ----------
+if [[ -f "$RUNTIME_DIR/.installed-asar" ]] && [[ -f "$(cat "$RUNTIME_DIR/.installed-asar" 2>/dev/null)" ]]; then
+  ASAR="$(cat "$RUNTIME_DIR/.installed-asar")"
+elif [[ -f "$ZC_ASAR.zcstats-orig" ]]; then
+  ASAR="$ZC_ASAR"
 else
-  log "未发现 app.asar 备份，跳过还原"
+  ASAR=""
 fi
 
-# 2. 移除 hooks 与命令
-log "移除 hooks 与 /stats 命令"
-"$NODE_BIN" "$RUNTIME_DIR/bin/configure.mjs" uninstall --zcode-dir "$ZCODE_DIR" 2>/dev/null \
-  || "$(dirname "$0")/plugins/session-stats/bin/configure.mjs" uninstall --zcode-dir "$ZCODE_DIR"
+if [[ -n "$ASAR" ]] && [[ -f "$ASAR.zcstats-orig" ]]; then
+  zc_log "还原 app.asar ($ASAR)"
+  "$NODE_BIN" "$SRC_DIR/app-patch/patch-app.mjs" restore --asar "$ASAR" --purge
+else
+  zc_log "未发现 app.asar 备份，跳过还原"
+fi
 
-# 3. 停止守护进程并清理运行时
-log "停止守护进程并清理运行时"
-pkill -f "node .*session-stats/daemon/daemon\.mjs" 2>/dev/null || true
-sleep 0.3
+# ---------- 2. 移除 hooks 与命令 ----------
+zc_log "移除 hooks 与 /stats 命令"
+# 优先用运行时里的 configure.mjs（可能在 ~/.zcode），否则用源码里的
+if [[ -f "$RUNTIME_DIR/bin/configure.mjs" ]]; then
+  "$NODE_BIN" "$RUNTIME_DIR/bin/configure.mjs" uninstall --zcode-dir "$ZCODE_DIR" 2>/dev/null \
+    || "$NODE_BIN" "$SRC_DIR/plugins/session-stats/bin/configure.mjs" uninstall --zcode-dir "$ZCODE_DIR"
+else
+  "$NODE_BIN" "$SRC_DIR/plugins/session-stats/bin/configure.mjs" uninstall --zcode-dir "$ZCODE_DIR"
+fi
+
+# ---------- 3. 停止 daemon + 清理运行时 ----------
+zc_log "停止统计守护进程并清理运行时"
+zc_daemon_stop || true
+rm -f "$RUNTIME_DIR/.installed-asar" "$RUNTIME_DIR/zcode.pid"
 rm -rf "$RUNTIME_DIR"
 
-log "卸载完成，重启 ZCode 生效"
+zc_log "卸载完成，重启 ZCode 生效"

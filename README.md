@@ -41,10 +41,23 @@ bash install.sh
 2. 在 `~/.zcode/cli/config.json` 注册 hooks（SessionStart / UserPromptSubmit / Stop）
    与 `/stats` 命令（`~/.zcode/commands/stats.md`）
 3. 先检查 ZCode 的 asar 完整性 fuse（若已开启则拒绝注入并说明原因），再给
-   `/Applications/ZCode.app` 的 `app.asar` 注入状态栏
+   ZCode 的 `app.asar` 注入状态栏（macOS 自动定位 `/Applications/ZCode.app`；
+   Windows/Linux 自动探测安装位置）
    （原文件备份为 `app.asar.zcstats-orig` 并记录版本元数据，可随时还原；
    发现备份与当前构建不一致时自动刷新备份）
 4. 重启本地统计守护进程（仅监听 127.0.0.1:47771，带 token 才能读取）
+
+### 平台支持
+
+| 平台 | 支持 | 说明 |
+|---|---|---|
+| macOS（Intel / Apple Silicon） | ✅ 完整 | 自动定位 `/Applications/ZCode.app` |
+| Linux（x64 / arm64，Beta） | ✅ 完整 | 自动探测安装位置（`~/.local/share`、`/opt` 等）；AppImage 需先解包 |
+| Windows（x64 / arm64） | ✅ 完整 | Git Bash / MSYS2 下运行 `bash install.sh`；自动定位 `%LOCALAPPDATA%\Programs\ZCode` |
+
+前置要求：ZCode 桌面版 + **Node.js ≥ 22.13**（node:sqlite 已默认开启；更早的 22.5+ 需带
+`--experimental-sqlite`，脚本会自动处理）。Windows 无需额外安装 sqlite3——统计查询统一走
+Node 内置的 node:sqlite；外部 sqlite3 仅作为兜底。
 
 ## 卸载
 
@@ -131,7 +144,9 @@ plugins/session-stats/       插件本体（marketplace 安装的组件包）
 app-patch/
   session-stats-bar.js       底部悬浮条 UI（注入渲染器，零依赖 vanilla JS）
   patch-app.mjs              asar 注入/还原/状态工具（含 fuse 检查与备份元数据）
-install.sh / uninstall.sh   一键安装/卸载（含 asar 注入）
+lib/
+  zcenv.sh                   跨平台环境探测（OS/node/asar 定位 + daemon 启停）
+install.sh / uninstall.sh   一键安装/卸载（含 asar 注入，跨平台）
 doctor.sh                   一键自检
 # 运行时产物（install.sh 生成于 ~/.zcode/session-stats/）：
 #   daemon-token               本地 HTTP 访问 token（0600）

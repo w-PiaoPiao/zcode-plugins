@@ -11,6 +11,7 @@ import fs from "node:fs";
 import net from "node:net";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { createRequire } from "node:module";
 import { spawn } from "node:child_process";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -58,7 +59,15 @@ async function ensureDaemon() {
     if (await portAlive(PORT)) return;
     const daemon = path.join(RUNTIME_DIR, "daemon", "daemon.mjs");
     if (!fs.existsSync(daemon)) return;
-    const child = spawn(process.execPath, [daemon], {
+    // 低版本 Node 需 --experimental-sqlite 才能用 node:sqlite（≥22.13 已默认开启，加了也无害）
+    const args = [];
+    try {
+      createRequire(import.meta.url)("node:sqlite");
+    } catch {
+      args.push("--experimental-sqlite");
+    }
+    args.push(daemon);
+    const child = spawn(process.execPath, args, {
       detached: true,
       stdio: "ignore",
       env: process.env,

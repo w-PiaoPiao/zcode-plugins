@@ -124,11 +124,21 @@ function hashFile(p) {
 }
 
 function readZcodeVersion(asarPath) {
+  // macOS 从 Contents/Info.plist 读；win/linux 读 resources 旁 package.json 的 version
+  if (process.platform === "darwin") {
+    try {
+      const contentsDir = path.dirname(path.dirname(path.resolve(asarPath)));
+      const xml = fs.readFileSync(path.join(contentsDir, "Info.plist"), "utf8");
+      const m = xml.match(/CFBundleShortVersionString[\s\S]{0,200}?<string>([^<]+)<\/string>/);
+      return m ? m[1] : null;
+    } catch {
+      return null;
+    }
+  }
   try {
-    const contentsDir = path.dirname(path.dirname(path.resolve(asarPath)));
-    const xml = fs.readFileSync(path.join(contentsDir, "Info.plist"), "utf8");
-    const m = xml.match(/CFBundleShortVersionString[\s\S]{0,200}?<string>([^<]+)<\/string>/);
-    return m ? m[1] : null;
+    const resourcesDir = path.dirname(path.resolve(asarPath));
+    const pkg = JSON.parse(fs.readFileSync(path.join(resourcesDir, "..", "package.json"), "utf8"));
+    return typeof pkg.version === "string" ? pkg.version : null;
   } catch {
     return null;
   }
@@ -154,11 +164,23 @@ function readBackupMeta(asarPath) {
 // 检查 Electron fuse：EnableEmbeddedAsarIntegrityValidation 开启时，
 // 改动 app.asar 会让 app 直接拒绝启动（“已损坏”），必须中止注入
 function checkFuses(asarPath) {
-  const contentsDir = path.dirname(path.dirname(path.resolve(asarPath)));
-  const candidates = [
-    path.join(contentsDir, "Frameworks", "Electron Framework.framework", "Versions", "A", "Electron Framework"),
-    path.join(contentsDir, "MacOS", "ZCode"),
-  ];
+  const resourcesDir = path.dirname(path.resolve(asarPath));
+  let candidates;
+  if (process.platform === "darwin") {
+    const contentsDir = path.dirname(path.dirname(path.resolve(asarPath)));
+    candidates = [
+      path.join(contentsDir, "Frameworks", "Electron Framework.framework", "Versions", "A", "Electron Framework"),
+      path.join(contentsDir, "MacOS", "ZCode"),
+    ];
+  } else {
+    // win: <resources>/../ZCode.exe（electron 主 exe）；linux: <resources>/../zcode 或同目录二进制
+    candidates = [
+      path.join(resourcesDir, "..", "ZCode.exe"),
+      path.join(resourcesDir, "..", "zcode"),
+      path.join(resourcesDir, "..", "..", "zcode"),
+      path.join(resourcesDir, "..", "..", "..", "zcode"),
+    ];
+  }
   let found = null;
   for (const bin of candidates) {
     if (!fs.existsSync(bin)) continue;

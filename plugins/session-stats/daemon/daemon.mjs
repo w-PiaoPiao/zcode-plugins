@@ -32,6 +32,10 @@ const POLL_MS = Number(process.env.ZC_STATS_POLL_MS || 1000);
 const IDLE_EXIT_MS = 30 * 60 * 1000; // 30 分钟无请求则退出（hook 会重新拉起）
 const LOG = path.join(RUNTIME_DIR, "daemon.log");
 const TOKEN_FILE = path.join(RUNTIME_DIR, "daemon-token");
+// install.sh 写入 ZCode 主进程 pid，daemon 轮询其存活以自愈退出（跨平台，替代 pgrep）
+const PID_FILE = process.env.ZC_STATS_PID_FILE || path.join(RUNTIME_DIR, "zcode.pid");
+// daemon 自身 pid 文件（install.sh/uninstall.sh 用它在重启/卸载时精确停掉本 daemon）
+const DAEMON_PID_FILE = path.join(RUNTIME_DIR, "daemon.pid");
 
 function log(...args) {
   try {
@@ -165,12 +169,17 @@ server.on("error", (err) => {
 
 server.listen(PORT, "127.0.0.1", () => {
   log(`daemon started on 127.0.0.1:${PORT} pid=${process.pid} db=${DB_PATH}`);
+  try {
+    fs.writeFileSync(DAEMON_PID_FILE, String(process.pid)); // 供 install/uninstall 定位本 daemon
+  } catch {}
   ensureToken();
   refresh();
   setInterval(refresh, POLL_MS).unref();
 });
 
 // 空闲退出 + ZCode 消失退出
+// 跨平台检测：install.sh 写入 ZCode 主进程 pid 到 PID_FILE，daemon 轮询该 pid 存活。
+// 避免依赖 macOS-only 的 /usr/bin/pgrep（Windows 无 pgrep，Linux 路径不同）。
 let zcodeGoneChecks = 0;
 setInterval(async () => {
   if (Date.now() - lastHitAt > IDLE_EXIT_MS) {
@@ -178,21 +187,44 @@ setInterval(async () => {
     process.exit(0);
   }
   try {
-    const { stdout } = await pExecFile2("/usr/bin/pgrep", ["-f", "ZCode.app"]);
-    zcodeGoneChecks = stdout.trim() ? 0 : zcodeGoneChecks + 1;
+    const pid = readPidFile();
+    const alive = pid ? await pidAlive(pid) : false;
+    zcodeGoneChecks = alive ? 0 : zcodeGoneChecks + 1;
     if (zcodeGoneChecks >= 3) {
-      log("ZCode.app not running — exit");
+      log("ZCode not running — exit");
       process.exit(0);
     }
   } catch {
-    // pgrep 无匹配时非零退出码
     zcodeGoneChecks++;
     if (zcodeGoneChecks >= 3) {
-      log("ZCode.app not running — exit");
+      log("ZCode not running — exit");
       process.exit(0);
     }
   }
 }, 30_000).unref();
+
+function readPidFile() {
+  try {
+    const v = Number.parseInt(fs.readFileSync(PID_FILE, "utf8").trim(), 10);
+    return Number.isFinite(v) && v > 0 ? v : null;
+  } catch {
+    return null;
+  }
+}
+
+// POSIX: kill(pid, 0) 探活；Windows: tasklist 查 PID（无 kill -0 语义）
+async function pidAlive(pid) {
+  if (process.platform === "win32") {
+    const { stdout } = await pExecFile2("tasklist", ["/FI", `PID eq ${pid}`, "/NH"]);
+    return stdout.includes(String(pid));
+  }
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (err) {
+    return err.code === "EPERM"; // 存在但无权限 → 仍算存活
+  }
+}
 
 process.on("SIGTERM", () => process.exit(0));
 process.on("SIGINT", () => process.exit(0));

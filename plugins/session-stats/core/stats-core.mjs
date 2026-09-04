@@ -15,15 +15,20 @@
 //   首 token = 请求级 TTFT 中位数（抗重试长尾）
 //   tok/s    = 总输出 / (总耗时 - 总 TTFT)
 //   缓存命中 = cache_read / (input + cache_write)  —— input 为含缓存读的总输入
-// 所有查询走 /usr/bin/sqlite3（macOS 自带），以 mode=ro 打开，不影响运行中的 ZCode。
+//
+// 所有查询走 node:sqlite（Node 22.5+ 内置），以只读模式打开，不影响运行中的 ZCode。
+// 跨平台：macOS/Linux/Windows 均无需外部 sqlite3（Windows 无系统 sqlite3，
+// 统一用 node:sqlite 彻底消除平台差异；Node 22.5 前或禁用时自动退回快照+外部 sqlite3）。
 
-import { execFile } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { execFile } from "node:child_process";
+import { createRequire } from "node:module";
 import { promisify } from "node:util";
 
 const pExecFile = promisify(execFile);
+const require = createRequire(import.meta.url);
 
 export const DEFAULT_DB_PATH = path.join(os.homedir(), ".zcode/cli/db/db.sqlite");
 export const DEFAULT_POINTER_PATH = path.join(
@@ -31,29 +36,85 @@ export const DEFAULT_POINTER_PATH = path.join(
   ".zcode/session-stats/current-session.json"
 );
 
-const SQLITE = "/usr/bin/sqlite3";
+const SQLITE_BIN = process.platform === "win32" ? "sqlite3.exe" : "sqlite3"; // 外部 sqlite3（仅兜底）
+// 环境显式禁用 node:sqlite 时退回外部 sqlite3（供调试/特殊环境），且不触发 require
+const USE_NODE_SQLITE =
+  process.env.ZC_STATS_FORCE_SQLITE3 !== "1" && (() => {
+    try {
+      require("node:sqlite");
+      return true;
+    } catch {
+      return false;
+    }
+  })();
+
+let DatabaseSync = null;
+if (USE_NODE_SQLITE) {
+  ({ DatabaseSync } = require("node:sqlite"));
+}
+
+// ---------- 查询核心（同步，node:sqlite）----------
+
+function querySqlNode(dbPath, statements) {
+  const db = new DatabaseSync(`file:${dbPath}?mode=ro`, { readOnly: true });
+  try {
+    return statements.map((sql) => db.prepare(sql).all());
+  } finally {
+    db.close();
+  }
+}
+
+// 兜底快照：node:sqlite 不可用时用外部 sqlite3 .backup 做一致性快照
+async function snapshotDb(dbPath) {
+  try {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "zcstats-"));
+    const tmp = path.join(dir, path.basename(dbPath));
+    await pExecFile(
+      SQLITE_BIN,
+      ["-cmd", ".timeout 2000", `file:${dbPath}?mode=ro`, `.backup ${tmp}`],
+      { timeout: 8000 }
+    );
+    return tmp;
+  } catch {
+    return null;
+  }
+}
 
 async function querySql(dbPath, statements) {
+  if (USE_NODE_SQLITE) {
+    try {
+      return querySqlNode(dbPath, statements);
+    } catch (err) {
+      // 只读打开失败（如 -shm 缺失/被占用）→ 一致性快照后重试（node:sqlite 同样受益）
+      const snap = await snapshotDb(dbPath);
+      if (!snap) throw err;
+      try {
+        return querySqlNode(snap, statements);
+      } finally {
+        fs.rmSync(path.dirname(snap), { recursive: true, force: true });
+      }
+    }
+  }
+  // 无 node:sqlite → 外部 sqlite3 -json 子进程（原实现）
   const args = ["-json", "-cmd", ".timeout 2000", `file:${dbPath}?mode=ro`, ...statements];
   try {
-    const { stdout } = await pExecFile(SQLITE, args, {
+    const { stdout } = await pExecFile(SQLITE_BIN, args, {
       maxBuffer: 16 * 1024 * 1024,
       timeout: 8000,
     });
     return parseMultiJson(stdout);
   } catch (err) {
-    // 只读打开失败（如 -shm 缺失）→ 用 sqlite3 .backup 做一致性快照后重试
-    const tmp = await snapshotDb(dbPath);
-    if (!tmp) throw err;
+    const snap = await snapshotDb(dbPath);
+    if (!snap) throw err;
     try {
       const { stdout } = await pExecFile(
-        SQLITE,
-        ["-json", "-cmd", ".timeout 2000", tmp, ...statements],
+        SQLITE_BIN,
+        ["-json", "-cmd", ".timeout 2000", snap, ...statements],
         { maxBuffer: 16 * 1024 * 1024, timeout: 8000 }
       );
       return parseMultiJson(stdout);
     } finally {
-      fs.rmSync(path.dirname(tmp), { recursive: true, force: true });
+      fs.rmSync(path.dirname(snap), { recursive: true, force: true });
     }
   }
 }
@@ -89,23 +150,6 @@ function parseMultiJson(stdout) {
     }
   }
   return docs;
-}
-
-// 用 sqlite3 自带的 .backup（只读 URI 源）做一致性快照，
-// 避免直接热拷贝 db+wal+shm 三件套得到撕裂/不一致的数据
-async function snapshotDb(dbPath) {
-  try {
-    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "zcstats-"));
-    const tmp = path.join(dir, path.basename(dbPath));
-    await pExecFile(
-      SQLITE,
-      ["-cmd", ".timeout 2000", `file:${dbPath}?mode=ro`, `.backup ${tmp}`],
-      { timeout: 8000 }
-    );
-    return tmp;
-  } catch {
-    return null;
-  }
 }
 
 // ---------- 会话指针 ----------
