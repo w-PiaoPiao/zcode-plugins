@@ -1,0 +1,40 @@
+{
+  "name": "yizhiwang-zcode-plugins",
+  "description": "Personal ZCode plugins marketplace: session token/performance stats bar, /stats command and local stats daemon.",
+  "description_i18n": {
+    "en": "Personal ZCode plugins marketplace: session token/performance stats bar, /stats command and local stats daemon.",
+    "zh-CN": "个人 ZCode 插件市场：会话 token/性能统计悬浮条、/stats 命令与本地统计守护进程。"
+  },
+  "owner": {
+    "name": "yizhiwang",
+    "url": "https://github.com/yizhiwang"
+  },
+  "plugins": [
+    {
+      "name": "session-stats",
+      "source": "./plugins/session-stats",
+      "displayName": "Session Stats",
+      "description": "Session token & performance stats bar pinned to the ZCode window bottom, plus a /stats command that renders a detailed stats card in chat. NOTE: the status bar itself requires running install.sh once (asar injection is outside the marketplace mechanism); the marketplace install provides the hooks + /stats command.",
+      "description_i18n": {
+        "en": "Session token & performance stats bar pinned to the ZCode window bottom, plus a /stats command that renders a detailed stats card in chat. NOTE: the status bar itself requires running install.sh once (asar injection is outside the marketplace mechanism); the marketplace install provides the hooks + /stats command.",
+        "zh-CN": "固定在 ZCode 窗口底部的会话 token 与性能统计悬浮条，以及一个在对话中渲染详细统计卡片的 /stats 命令。注意：悬浮条本身需要先运行一次 install.sh（asar 注入不在 marketplace 机制内）；marketplace 安装提供 hooks 与 /stats 命令。"
+      },
+      "version": "0.3.0",
+      "author": {
+        "name": "yizhiwang",
+        "url": "https://github.com/yizhiwang"
+      },
+      "license": "MIT",
+      "category": "developer-tools",
+      "keywords": [
+        "token",
+        "usage",
+        "stats",
+        "statusbar",
+        "performance",
+        "ttft",
+        "cache"
+      ]
+    }
+  ]
+}

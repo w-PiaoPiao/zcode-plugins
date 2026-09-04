@@ -29,7 +29,7 @@ fi
 # 2. 移除 hooks 与命令
 log "移除 hooks 与 /stats 命令"
 "$NODE_BIN" "$RUNTIME_DIR/bin/configure.mjs" uninstall --zcode-dir "$ZCODE_DIR" 2>/dev/null \
-  || "$(dirname "$0")/session-stats/bin/configure.mjs" uninstall --zcode-dir "$ZCODE_DIR"
+  || "$(dirname "$0")/plugins/session-stats/bin/configure.mjs" uninstall --zcode-dir "$ZCODE_DIR"
 
 # 3. 停止守护进程并清理运行时
 log "停止守护进程并清理运行时"

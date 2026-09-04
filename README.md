@@ -15,7 +15,20 @@ token 用量与性能指标（不依赖输入框/聊天区结构，任何界面�
   显示「会话统计 · 等待本地服务…」，一旦就绪立即显示真实指标，不会消失
 - 另有 `/stats` 斜杠命令，可在对话里让模型渲染一张更详细的统计卡片
 
-## 安装
+## 作为 marketplace 安装（hooks / /stats 命令）
+
+本仓库是标准 ZCode 插件市场（顶层 `marketplace.json`）。在 ZCode 中：
+
+1. **设置 → 插件管理 → Discover**，点 **`+` 添加市场**，填入本仓库
+   GitHub 地址（`https://github.com/<你的用户名>/<仓库名>`）；
+2. 找到 **session-stats** 插件，点 **Get / 安装**；
+3. 安装后启用，即获得 hooks（会话指针 + daemon 拉起）与 `/stats` 命令。
+
+> ⚠️ **悬浮条不在 marketplace 机制内**：状态栏需要修改 `ZCode.app` 资源
+> （asar 注入），插件市场机制只分发 manifest 声明的组件，无法做到这一点。
+> 要在本机显示悬浮条，请继续按下方 **安装** 执行一次 `install.sh`。
+
+## 安装（完整功能，含底部悬浮条）
 
 ```bash
 bash install.sh
@@ -105,19 +118,20 @@ ZCode 数据库 ◄──只读查询── daemon.mjs ──HTTP 127.0.0.1:4777
 ## 文件结构
 
 ```
-session-stats/          插件本体（运行时 + 插件包）
-  .zcode-plugin/plugin.json   插件 manifest（仅声明 hooks；状态栏必须走 install.sh）
-  hooks/hooks.json            插件版 hook 声明
-  hooks/on-event.mjs          hook 入口：记会话指针 + 拉起守护进程
-  daemon/daemon.mjs           本地统计守护进程（127.0.0.1:47771，token 鉴权）
-  core/stats-core.mjs         数据库只读聚合
-  bin/cli.mjs                 命令行（--json 供 /stats 用）
-  bin/configure.mjs           hooks/命令注册器
-  commands/stats.md           /stats 命令定义
+marketplace.json             市场清单（ZCode 添加本仓库为市场时读取）
+plugins/session-stats/       插件本体（marketplace 安装的组件包）
+  .zcode-plugin/plugin.json  插件 manifest（hooks + /stats 命令声明）
+  hooks/hooks.json           插件版 hook 声明
+  hooks/on-event.mjs         hook 入口：记会话指针 + 拉起守护进程
+  daemon/daemon.mjs          本地统计守护进程（127.0.0.1:47771，token 鉴权）
+  core/stats-core.mjs        数据库只读聚合
+  bin/cli.mjs                命令行（--json 供 /stats 用）
+  bin/configure.mjs          hooks/命令注册器
+  commands/stats.md          /stats 命令定义
 app-patch/
-  session-stats-bar.js        状态栏 UI（注入渲染器，零依赖 vanilla JS）
-  patch-app.mjs               asar 注入/还原/状态工具（含 fuse 检查与备份元数据）
-install.sh / uninstall.sh   一键安装/卸载
+  session-stats-bar.js       底部悬浮条 UI（注入渲染器，零依赖 vanilla JS）
+  patch-app.mjs              asar 注入/还原/状态工具（含 fuse 检查与备份元数据）
+install.sh / uninstall.sh   一键安装/卸载（含 asar 注入）
 doctor.sh                   一键自检
 # 运行时产物（install.sh 生成于 ~/.zcode/session-stats/）：
 #   daemon-token               本地 HTTP 访问 token（0600）

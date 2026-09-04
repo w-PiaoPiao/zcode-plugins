@@ -10,7 +10,7 @@
 set -euo pipefail
 
 SRC_DIR="$(cd "$(dirname "$0")" && pwd)"
-PLUGIN_DIR="$SRC_DIR/session-stats"
+PLUGIN_DIR="$SRC_DIR/plugins/session-stats"
 APP_PATCH_DIR="$SRC_DIR/app-patch"
 ZCODE_DIR="${HOME}/.zcode"
 RUNTIME_DIR="${ZCODE_DIR}/session-stats"
