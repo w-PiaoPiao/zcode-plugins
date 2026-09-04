@@ -86,7 +86,6 @@ const SEG_DEFS = [
 let bar = null;
 let segs = {};
 let failCount = 0;
-let lastSessionId = null;
 
 function fmtTokens(n) {
   if (n == null || isNaN(n)) return "—";
@@ -212,16 +211,33 @@ async function fetchStats(sessionId) {
   return null;
 }
 
-// ---------- 当前会话探测（尽力而为） ----------
-// 固定条不需要依赖 composer 锚点；这里仅尝试从 React fiber 找 taskId 以便
-// 每个窗口/标签显示自己的会话。任何失败都回退最近活跃会话（daemon 兜底），
-// 绝不阻塞显示。
+// ---------- 视图与会话探测 ----------
+// 悬浮条只在聊天对话视图显示：
+//   - 更新弹窗是独立窗口但加载同一 index.html（windowKind=update-status）→ 不启动
+//   - 设置页是同窗覆盖层（聊天区被 inert 隐藏）→ 隐藏悬浮条
+//   - 新建对话（draft）无会话 id → 清缓存、不带 session 查询（显示全 0）
+
 function looksLikeSessionId(v) {
   return typeof v === "string" && /^sess_[\w.-]{6,200}$/.test(v);
 }
 
-function detectSessionId() {
-  const region = document.querySelector(".chat-composer-region");
+// 新建对话哨兵：传给 daemon 一个格式合法但必然不存在的会话 id，
+// daemon 对显式会话走"查无数据 → 全 0"分支，从而显示全 0 而非上一个对话的数据
+const DRAFT_SENTINEL = "sess_draft_empty_00000000-0000-0000-0000-000000000000";
+
+// 会话权威信号：conversation 容器上的 data-session-id（sess_* 或 draft）
+function sessionIdFromDom() {
+  const pane = document.querySelector('[data-testid="v4-session-pane-workspace-main"]');
+  if (!pane) return null; // 容器不存在 → 无法判定（交给视图门控）
+  const v = pane.getAttribute("data-session-id");
+  if (looksLikeSessionId(v)) return v;
+  if (v === "draft" || v === "") return DRAFT_SENTINEL; // 新建/空对话
+  return null;
+}
+
+// 兜底：React fiber 找 taskId（仅当 DOM 属性缺失时）
+function sessionIdFromFiber() {
+  const region = document.querySelector('[data-testid="v4-composer"], .chat-composer-region');
   if (!region) return null;
   const anchors = [region.querySelector("textarea"), region].filter(Boolean);
   for (const el of anchors) {
@@ -241,12 +257,34 @@ function detectSessionId() {
   return null;
 }
 
-function currentSessionId() {
-  const id = detectSessionId();
-  if (id !== null) lastSessionId = id;
-  return lastSessionId;
+// 返回 { visible, sessionId }
+//   visible=false → 不在聊天视图（设置/其他），悬浮条应隐藏
+//   sessionId      → sess_* 或 null（无会话/新建对话 → 不带 session 查询）
+function resolveViewState() {
+  // 设置页开着，或聊天区被 inert 覆盖 → 不可见
+  if (document.querySelector('[data-testid="settings-page"]')) return { visible: false, sessionId: null };
+  if (document.querySelector('[data-root-workspace-surface="inert"]')) return { visible: false, sessionId: null };
+
+  const composer = document.querySelector('[data-testid="v4-composer"]');
+  if (!composer || composer.offsetParent === null || composer.getBoundingClientRect().height === 0) {
+    // 无 composer 或不可见（可能在其他视图/隐藏）→ 隐藏
+    return { visible: false, sessionId: null };
+  }
+
+  // 聊天视图可见：解析会话
+  const fromDom = sessionIdFromDom();
+  if (fromDom === DRAFT_SENTINEL) return { visible: true, sessionId: DRAFT_SENTINEL }; // 新建对话 → 全 0
+  if (looksLikeSessionId(fromDom)) return { visible: true, sessionId: fromDom };
+
+  // DOM 属性缺失 → fiber 兜底
+  const fromFiber = sessionIdFromFiber();
+  if (fromFiber) return { visible: true, sessionId: fromFiber };
+
+  // 都拿不到 → 视为无会话（不沿用缓存，避免显示上一个对话）
+  return { visible: true, sessionId: DRAFT_SENTINEL };
 }
 
+// 不再跨会话沿用 lastSessionId 缓存：新建对话/无会话时用 DRAFT_SENTINEL 强制全 0
 async function tick() {
   if (!bar || !bar.isConnected) {
     bar = buildBar();
@@ -255,10 +293,18 @@ async function tick() {
     bar.style.display = "";
   }
   if (document.hidden) return;
-  const data = await fetchStats(currentSessionId());
+
+  const view = resolveViewState();
+  if (!view.visible) {
+    bar.style.display = "none"; // 设置页/非聊天视图 → 隐藏
+    return;
+  }
+
+  const data = await fetchStats(view.sessionId);
   if (data) {
     failCount = 0;
     render(data);
+    bar.style.display = "";
   } else {
     failCount++;
     setWaitState();
@@ -267,6 +313,12 @@ async function tick() {
 }
 
 function start() {
+  // 窗口级门控：更新弹窗是独立 BrowserWindow 但加载同一 index.html，
+  // 通过 windowKind=update-status 识别并直接不启动（该窗口不显示悬浮条）
+  try {
+    if (new URLSearchParams(location.search).get("windowKind") === "update-status") return;
+  } catch {}
+
   const style = document.createElement("style");
   style.textContent = CSS;
   document.head.appendChild(style);
