@@ -1,0 +1,288 @@
+// session-stats-bar.js — 注入 ZCode 渲染器的会话统计悬浮条（固定底部）
+//
+// 由 patch-app.mjs 注入 index.html（<script type="module" src="./assets/session-stats-bar.js">）。
+// 职责：
+//   1. 在窗口底部固定一条会话统计（不依赖 chat-composer 等任何业务锚点，
+//      React 重渲染/切换会话/整体布局重建都不会让它消失）
+//   2. 每秒从本地统计守护进程（127.0.0.1:47771/v1/stats）拉取数据并渲染
+//   3. daemon 未就绪（如 ZCode 刚重启、hook 尚未拉起 daemon）时显示等待占位，
+//      一旦就绪立即显示真实指标 —— 永不隐藏
+// 数据由 session-stats 插件的守护进程从 ~/.zcode/cli/db/db.sqlite 聚合而来。
+// token 由 patch-app.mjs 通过 --token 注入（与 ~/.zcode/session-stats/daemon-token 一致），
+// 占位符 __ZC_STATS_TOKEN__ 在烘焙时被替换。
+
+const DEFAULT_PORT = 47771;
+const POLL_MS = 1000;
+const TOKEN = "__ZC_STATS_TOKEN__";
+
+const CSS = `
+[data-zcstats-bar] {
+  position: fixed;
+  left: 50%;
+  bottom: 8px;
+  transform: translateX(-50%);
+  z-index: 2147483000;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  max-width: min(96vw, 720px);
+  padding: 5px 14px;
+  border-radius: 999px;
+  background: var(--color-surface, #ffffff);
+  border: 1px solid var(--color-border, #e4e4e7);
+  box-shadow: 0 6px 24px rgba(0, 0, 0, 0.08);
+  font-size: 11.5px;
+  line-height: 16px;
+  letter-spacing: 0.01em;
+  font-variant-numeric: tabular-nums;
+  color: var(--color-foreground-subtle, #71717a);
+  white-space: nowrap;
+  overflow: hidden;
+  user-select: none;
+  -webkit-user-select: none;
+  pointer-events: auto;
+}
+/* 窄窗口收缩：tokens 段允许省略 */
+[data-zcstats-bar] .zcstats-seg { display: inline-flex; align-items: baseline; gap: 4px; flex: 0 0 auto; }
+[data-zcstats-bar] .zcstats-seg[data-zcstats-seg="tokens"] { flex: 0 1 auto; min-width: 0; overflow: hidden; }
+[data-zcstats-bar] .zcstats-seg .zcstats-v { overflow: hidden; text-overflow: ellipsis; }
+[data-zcstats-bar] .zcstats-k { color: var(--color-foreground-subtlest, #a1a1aa); flex: none; }
+[data-zcstats-bar] .zcstats-v { color: var(--color-foreground-subtle, #71717a); }
+[data-zcstats-bar]:hover .zcstats-v { color: var(--color-foreground, #18181b); }
+[data-zcstats-bar] .zcstats-dot {
+  width: 7px; height: 7px; border-radius: 9999px;
+  background: transparent;
+  border: 1.5px solid var(--color-border, #e4e4e7);
+  flex: none;
+}
+[data-zcstats-bar].zcstats-live .zcstats-dot {
+  border-color: transparent;
+  background: var(--color-git-added, #22c55e);
+  animation: zcstats-pulse 1.6s ease-in-out infinite;
+}
+[data-zcstats-bar].zcstats-wait .zcstats-dot {
+  border-color: transparent;
+  background: var(--color-foreground-subtlest, #a1a1aa);
+  animation: zcstats-pulse 1.2s ease-in-out infinite;
+}
+[data-zcstats-bar] .zcstats-sep { color: var(--color-border, #e4e4e7); flex: none; }
+[data-zcstats-bar].zcstats-wait .zcstats-sep { display: none; }
+@keyframes zcstats-pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.35; } }
+/* 触屏/悬停不影响展示 */
+@media (prefers-reduced-motion: reduce) {
+  [data-zcstats-bar].zcstats-live .zcstats-dot,
+  [data-zcstats-bar].zcstats-wait .zcstats-dot { animation: none; }
+}
+`;
+
+const SEG_DEFS = [
+  { id: "turns" },
+  { id: "llm" },
+  { id: "speed" },
+  { id: "cache" },
+  { id: "tokens" },
+];
+
+let bar = null;
+let segs = {};
+let failCount = 0;
+let lastSessionId = null;
+
+function fmtTokens(n) {
+  if (n == null || isNaN(n)) return "—";
+  if (n < 1000) return String(n);
+  if (n < 1_000_000) {
+    const k = n / 1000;
+    return (k >= 100 ? Math.round(k) : k.toFixed(1)) + "K";
+  }
+  return (n / 1_000_000).toFixed(2) + "M";
+}
+
+function fmtDur(ms) {
+  if (ms == null || ms <= 0) return "—";
+  const s = ms / 1000;
+  if (s < 60) return s.toFixed(1) + "s";
+  const m = Math.floor(s / 60);
+  if (m < 60) return `${m}m ${Math.round(s - m * 60)}s`;
+  const h = Math.floor(m / 60);
+  return `${h}h ${m - h * 60}m`;
+}
+
+function fmtSec(ms) {
+  if (ms == null || isNaN(ms)) return "—";
+  return (ms / 1000).toFixed(ms < 9500 ? 1 : 0) + "s";
+}
+
+function buildBar() {
+  const el = document.createElement("div");
+  el.setAttribute("data-zcstats-bar", "");
+  el.style.display = "none";
+  const dot = document.createElement("span");
+  dot.className = "zcstats-dot";
+  dot.title = "会话统计";
+  el.appendChild(dot);
+  for (let i = 0; i < SEG_DEFS.length; i++) {
+    if (i > 0) {
+      const sep = document.createElement("span");
+      sep.className = "zcstats-sep";
+      sep.textContent = "│";
+      el.appendChild(sep);
+    }
+    const seg = document.createElement("span");
+    seg.className = "zcstats-seg";
+    seg.setAttribute("data-zcstats-seg", SEG_DEFS[i].id);
+    const k = document.createElement("span");
+    k.className = "zcstats-k";
+    const v = document.createElement("span");
+    v.className = "zcstats-v";
+    seg.append(k, v);
+    el.appendChild(seg);
+    segs[SEG_DEFS[i].id] = { seg, k, v };
+  }
+  return el;
+}
+
+function setSeg(id, label, value, title) {
+  const s = segs[id];
+  if (!s) return;
+  s.seg.style.display = "";
+  if (s.k) s.k.textContent = label;
+  s.v.textContent = value;
+  if (title) s.seg.title = title;
+  else s.seg.removeAttribute("title");
+}
+
+function hideSeg(id) {
+  const s = segs[id];
+  if (s) s.seg.style.display = "none";
+}
+
+function setWaitState() {
+  if (!bar) return;
+  bar.classList.add("zcstats-wait");
+  bar.classList.remove("zcstats-live");
+  for (const seg of SEG_DEFS) hideSeg(seg.id);
+  // 把整条作为一个可读状态
+  setSeg("turns", "", "会话统计 · 等待本地服务…", "统计守护进程尚未就绪，正在自动重试");
+}
+
+function render(data) {
+  if (!bar) return;
+  bar.classList.remove("zcstats-wait");
+  const t = data && data.available ? data.totals : null;
+  // daemon 可达但无数据（空会话/新会话）：显示全 0，绝不隐藏
+  if (!t) {
+    bar.classList.remove("zcstats-live");
+    setSeg("turns", "", "0 轮 · 0 步", "当前会话暂无统计数据");
+    setSeg("llm", "LLM", "—", "纯模型耗时");
+    setSeg("speed", "首 token", "—", "首 token / 输出吞吐");
+    setSeg("cache", "缓存", "—", "缓存命中");
+    setSeg("tokens", "", "输入 0 · 输出 0", "累计输入/输出 token");
+    bar.style.display = "";
+    return;
+  }
+  bar.classList.toggle("zcstats-live", !!data.live);
+  if (data.live) {
+    bar.querySelector(".zcstats-dot").title = `进行中 · 已 ${fmtDur(Date.now() - data.live.since)}`;
+  }
+  setSeg("turns", "", `${t.turns} 轮 · ${t.steps} 步`,
+    `会话：${(data.session?.title || data.session?.id || "").slice(0, 80)}\n用户消息触发的轮：${t.turns}\n智能体步数（模型请求）：${t.steps}${t.retries ? `\n重试：${t.retries} 次` : ""}`);
+  setSeg("llm", "LLM", fmtDur(t.llmMs), `纯模型耗时 ${fmtDur(t.llmMs)}（${t.attempts} 次请求，不含工具执行）`);
+  setSeg("speed", "首 token", `${fmtSec(t.avgTtftMs)} · ${t.tokPerSec} tok/s`,
+    `首 token 中位 ${t.avgTtftMs != null ? (t.avgTtftMs / 1000).toFixed(2) + "s" : "—"}\n输出吞吐 ${t.tokPerSec} tok/s（总输出 / 生成时间）`);
+  setSeg("cache", "缓存", t.cacheHitPct != null ? t.cacheHitPct + "%" : "—",
+    `缓存命中 ${t.cacheHitPct != null ? t.cacheHitPct + "%" : "—"}\n命中 ${fmtTokens(t.cacheReadTokens)} tok / 输入 ${fmtTokens(t.inputTokens + (t.cacheWriteTokens || 0))} tok`);
+  setSeg("tokens", "", `输入 ${fmtTokens(t.inputTokens)} · 输出 ${fmtTokens(t.outputTokens)}`,
+    `累计输入 ${t.inputTokens?.toLocaleString()} tok（每步都会重发上下文，随轮数增长是正常的）\n累计输出 ${t.outputTokens?.toLocaleString()} tok`);
+  bar.style.display = "";
+}
+
+async function fetchStats(sessionId) {
+  const q = `?t=${encodeURIComponent(TOKEN)}` + (sessionId ? `&session=${encodeURIComponent(sessionId)}` : "");
+  try {
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), 1500);
+    const res = await fetch(`http://127.0.0.1:${DEFAULT_PORT}/v1/stats${q}`, {
+      signal: ctrl.signal,
+      cache: "no-store",
+    });
+    clearTimeout(timer);
+    if (res.ok) return await res.json();
+  } catch {}
+  return null;
+}
+
+// ---------- 当前会话探测（尽力而为） ----------
+// 固定条不需要依赖 composer 锚点；这里仅尝试从 React fiber 找 taskId 以便
+// 每个窗口/标签显示自己的会话。任何失败都回退最近活跃会话（daemon 兜底），
+// 绝不阻塞显示。
+function looksLikeSessionId(v) {
+  return typeof v === "string" && /^sess_[\w.-]{6,200}$/.test(v);
+}
+
+function detectSessionId() {
+  const region = document.querySelector(".chat-composer-region");
+  if (!region) return null;
+  const anchors = [region.querySelector("textarea"), region].filter(Boolean);
+  for (const el of anchors) {
+    const key = Object.keys(el).find((k) => k.startsWith("__reactFiber$"));
+    let fiber = key ? el[key] : null;
+    let hops = 0;
+    while (fiber && hops < 80) {
+      const props = fiber.memoizedProps;
+      if (props) {
+        const v = props.taskId ?? props.activeTaskId;
+        if (looksLikeSessionId(v)) return v;
+      }
+      fiber = fiber.return;
+      hops++;
+    }
+  }
+  return null;
+}
+
+function currentSessionId() {
+  const id = detectSessionId();
+  if (id !== null) lastSessionId = id;
+  return lastSessionId;
+}
+
+async function tick() {
+  if (!bar || !bar.isConnected) {
+    bar = buildBar();
+    document.body.appendChild(bar);
+    setWaitState();
+    bar.style.display = "";
+  }
+  if (document.hidden) return;
+  const data = await fetchStats(currentSessionId());
+  if (data) {
+    failCount = 0;
+    render(data);
+  } else {
+    failCount++;
+    setWaitState();
+    bar.style.display = "";
+  }
+}
+
+function start() {
+  const style = document.createElement("style");
+  style.textContent = CSS;
+  document.head.appendChild(style);
+
+  bar = buildBar();
+  document.body.appendChild(bar);
+  setWaitState();
+  bar.style.display = "";
+
+  setInterval(tick, POLL_MS);
+  document.addEventListener("visibilitychange", tick);
+  tick();
+}
+
+if (document.readyState === "loading") {
+  document.addEventListener("DOMContentLoaded", start, { once: true });
+} else {
+  start();
+}
