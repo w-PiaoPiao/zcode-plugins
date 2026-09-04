@@ -3,7 +3,7 @@
 // 职责：
 //   1. 周期性从 db.sqlite 聚合当前会话统计（默认 1s）
 //   2. GET /v1/stats  返回 JSON（token 鉴权；CORS 只回显请求方 Origin，不给通配符）
-//   3. 自愈：ZCode 退出且长期空闲后自动退出，由 hook 在下次会话时重新拉起
+//   3. 常驻：随 ZCode 存活（ZCode 退出后自动退出），由 hook 兜底拉起
 //
 // 鉴权：token 存于 RUNTIME_DIR/daemon-token（0600，install.sh 生成；缺失时自动生成）。
 //       状态栏用 ?t= 传参（补丁时烘焙同一 token），CLI 用 x-zcstats-token 头传递；
@@ -29,7 +29,6 @@ const PORT = Number(process.env.ZC_STATS_PORT || 47771);
 const DB_PATH = process.env.ZC_STATS_DB || DEFAULT_DB_PATH;
 const POINTER_PATH = process.env.ZC_STATS_POINTER || DEFAULT_POINTER_PATH;
 const POLL_MS = Number(process.env.ZC_STATS_POLL_MS || 1000);
-const IDLE_EXIT_MS = 30 * 60 * 1000; // 30 分钟无请求则退出（hook 会重新拉起）
 const LOG = path.join(RUNTIME_DIR, "daemon.log");
 const TOKEN_FILE = path.join(RUNTIME_DIR, "daemon-token");
 // install.sh 写入 ZCode 主进程 pid，daemon 轮询其存活以自愈退出（跨平台，替代 pgrep）
@@ -84,7 +83,6 @@ function writeCORS(req, res) {
 }
 
 let cache = { available: false, reason: "warming-up", generatedAt: 0 };
-let lastHitAt = Date.now();
 let dbMissingLogged = false;
 
 async function refresh() {
@@ -124,7 +122,6 @@ const server = http.createServer(async (req, res) => {
     res.end();
     return;
   }
-  lastHitAt = Date.now();
   if (url.pathname === "/v1/health") {
     writeCORS(req, res);
     res.writeHead(200, { "Content-Type": "application/json" });
@@ -177,18 +174,21 @@ server.listen(PORT, "127.0.0.1", () => {
   setInterval(refresh, POLL_MS).unref();
 });
 
-// 空闲退出 + ZCode 消失退出
+// ZCode 消失退出（常驻策略）
 // 跨平台检测：install.sh 写入 ZCode 主进程 pid 到 PID_FILE，daemon 轮询该 pid 存活。
-// 避免依赖 macOS-only 的 /usr/bin/pgrep（Windows 无 pgrep，Linux 路径不同）。
+// 不再做空闲超时退出：空闲退出会让状态栏在用户回来时显示“等待本地服务…”，
+// 直到下一次 hook 才拉起 daemon —— 体验割裂。daemon 随 ZCode 常驻即可
+// （ZCode 退出后由本探活自动退出，不泄漏资源）。
+// pid 文件缺失（如旧安装/Windows 未写入）时保守常驻，不误判 ZCode 已退出。
 let zcodeGoneChecks = 0;
 setInterval(async () => {
-  if (Date.now() - lastHitAt > IDLE_EXIT_MS) {
-    log("idle timeout — exit");
-    process.exit(0);
-  }
   try {
     const pid = readPidFile();
-    const alive = pid ? await pidAlive(pid) : false;
+    if (!pid) {
+      zcodeGoneChecks = 0; // 无法探活 → 保持运行（宁可多驻留，不可误退）
+      return;
+    }
+    const alive = await pidAlive(pid);
     zcodeGoneChecks = alive ? 0 : zcodeGoneChecks + 1;
     if (zcodeGoneChecks >= 3) {
       log("ZCode not running — exit");
