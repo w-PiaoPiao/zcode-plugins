@@ -67,10 +67,17 @@ async function ensureDaemon() {
       args.push("--experimental-sqlite");
     }
     args.push(daemon);
+    // 把 asar 路径传给 daemon 供探活：优先环境变量，否则读 install.sh 写的 .installed-asar
+    let asar = process.env.ZC_STATS_ASAR || "";
+    if (!asar) {
+      try {
+        asar = fs.readFileSync(path.join(RUNTIME_DIR, ".installed-asar"), "utf8").trim();
+      } catch {}
+    }
     const child = spawn(process.execPath, args, {
       detached: true,
       stdio: "ignore",
-      env: process.env,
+      env: asar ? { ...process.env, ZC_STATS_ASAR: asar } : process.env,
     });
     child.unref();
   } catch {}

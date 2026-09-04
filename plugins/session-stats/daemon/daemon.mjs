@@ -31,10 +31,10 @@ const POINTER_PATH = process.env.ZC_STATS_POINTER || DEFAULT_POINTER_PATH;
 const POLL_MS = Number(process.env.ZC_STATS_POLL_MS || 1000);
 const LOG = path.join(RUNTIME_DIR, "daemon.log");
 const TOKEN_FILE = path.join(RUNTIME_DIR, "daemon-token");
-// install.sh 写入 ZCode 主进程 pid，daemon 轮询其存活以自愈退出（跨平台，替代 pgrep）
-const PID_FILE = process.env.ZC_STATS_PID_FILE || path.join(RUNTIME_DIR, "zcode.pid");
 // daemon 自身 pid 文件（install.sh/uninstall.sh 用它在重启/卸载时精确停掉本 daemon）
 const DAEMON_PID_FILE = path.join(RUNTIME_DIR, "daemon.pid");
+// ZCode 的 app.asar 路径（install.sh 通过 ZC_STATS_ASAR 注入），用于探活匹配
+const ASAR_APP_PATH = process.env.ZC_STATS_ASAR || "";
 
 function log(...args) {
   try {
@@ -175,20 +175,15 @@ server.listen(PORT, "127.0.0.1", () => {
 });
 
 // ZCode 消失退出（常驻策略）
-// 跨平台检测：install.sh 写入 ZCode 主进程 pid 到 PID_FILE，daemon 轮询该 pid 存活。
-// 不再做空闲超时退出：空闲退出会让状态栏在用户回来时显示“等待本地服务…”，
-// 直到下一次 hook 才拉起 daemon —— 体验割裂。daemon 随 ZCode 常驻即可
-// （ZCode 退出后由本探活自动退出，不泄漏资源）。
-// pid 文件缺失（如旧安装/Windows 未写入）时保守常驻，不误判 ZCode 已退出。
+// 实时检测 ZCode 是否在运行（不依赖可能过期的 zcode.pid）：
+//   macOS/Linux —— 用 pgrep 找命令行带 <asar>/app.asar 的 renderer 进程（其父进程即主进程，
+//                   或直接认定 renderer 存在即 ZCode 在跑）
+//   Windows     —— tasklist 查 ZCode.exe
+// 找不到时连续累计 3 次（约 90s）才退出。检测工具缺失时保守常驻，不误判退出。
 let zcodeGoneChecks = 0;
 setInterval(async () => {
   try {
-    const pid = readPidFile();
-    if (!pid) {
-      zcodeGoneChecks = 0; // 无法探活 → 保持运行（宁可多驻留，不可误退）
-      return;
-    }
-    const alive = await pidAlive(pid);
+    const alive = await zcodeRunning();
     zcodeGoneChecks = alive ? 0 : zcodeGoneChecks + 1;
     if (zcodeGoneChecks >= 3) {
       log("ZCode not running — exit");
@@ -203,27 +198,28 @@ setInterval(async () => {
   }
 }, 30_000).unref();
 
-function readPidFile() {
-  try {
-    const v = Number.parseInt(fs.readFileSync(PID_FILE, "utf8").trim(), 10);
-    return Number.isFinite(v) && v > 0 ? v : null;
-  } catch {
-    return null;
-  }
-}
-
-// POSIX: kill(pid, 0) 探活；Windows: tasklist 查 PID（无 kill -0 语义）
-async function pidAlive(pid) {
+// ZCode 是否在运行（跨平台实时检测）
+async function zcodeRunning() {
   if (process.platform === "win32") {
-    const { stdout } = await pExecFile2("tasklist", ["/FI", `PID eq ${pid}`, "/NH"]);
-    return stdout.includes(String(pid));
+    const { stdout } = await pExecFile2("tasklist", ["/FI", "IMAGENAME eq ZCode.exe", "/NH"]);
+    return /ZCode\.exe/i.test(stdout);
   }
+  // macOS/Linux：renderer 进程的命令行带 <app>/Resources/app.asar 的 --app-path，
+  // 是 ZCode 在跑的可靠信号（主进程 argv[0] 会被重写成裸 "ZCode"，不可靠）。
+  if (ASAR_APP_PATH) {
+    try {
+      const { stdout } = await pExecFile2("/usr/bin/pgrep", ["-f", "--", `${ASAR_APP_PATH}`]);
+      if (stdout.trim()) return true;
+    } catch {}
+  }
+  // 无 asar 锚点或上面没匹配到：宽松匹配兜底（有 ZCode 相关进程即认为在跑）
   try {
-    process.kill(pid, 0);
-    return true;
-  } catch (err) {
-    return err.code === "EPERM"; // 存在但无权限 → 仍算存活
+    const { stdout } = await pExecFile2("/usr/bin/pgrep", ["-f", "ZCode"]);
+    if (stdout.trim()) return true;
+  } catch {
+    return false;
   }
+  return false;
 }
 
 process.on("SIGTERM", () => process.exit(0));

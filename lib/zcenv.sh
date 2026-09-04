@@ -132,19 +132,23 @@ zc_daemon_start() {
   # 用 node detached spawn 启动：daemon 脱离父 shell/进程组，install.sh 退出后仍存活。
   # （nohup ... & 在部分 shell/CI 里会被连带清理；detached spawn 是跨平台可靠做法，
   #   hook 拉起 daemon 用的正是同一机制。）
+  # 通过 ZC_STATS_ASAR 把 asar 路径传给 daemon（供其按 --app-path 锚点探活 ZCode）
   "$NODE_BIN" -e '
     const { spawn } = require("child_process");
     const fs = require("fs");
     const path = require("path");
     const rt = process.argv[1];
+    const asar = process.argv[2] || "";
     const out = fs.openSync(path.join(rt, "daemon.log"), "a");
     const child = spawn(process.execPath, [path.join(rt, "daemon", "daemon.mjs")], {
-      detached: true, stdio: ["ignore", out, out],
+      detached: true,
+      stdio: ["ignore", out, out],
+      env: { ...process.env, ZC_STATS_ASAR: asar },
     });
     child.unref();
-  ' "$RUNTIME_DIR" 2>/dev/null || {
-    # 兜底：nohup 后台
-    ( nohup "$NODE_BIN" "$RUNTIME_DIR/daemon/daemon.mjs" >> "$RUNTIME_DIR/daemon.log" 2>&1 & )
+  ' "$RUNTIME_DIR" "$ZC_ASAR" 2>/dev/null || {
+    # 兜底：nohup 后台（带上 ZC_STATS_ASAR）
+    ( ZC_STATS_ASAR="$ZC_ASAR" nohup "$NODE_BIN" "$RUNTIME_DIR/daemon/daemon.mjs" >> "$RUNTIME_DIR/daemon.log" 2>&1 & )
   }
 }
 
