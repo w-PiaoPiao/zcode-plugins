@@ -7,8 +7,8 @@
     "zh-CN": "会话 token 与性能统计：轮/步、LLM 耗时、首 token、tok/s、缓存命中、输入/输出 token——通过固定在 ZCode 窗口底部的悬浮条展示（悬浮条本身需要 install.sh；本 manifest 提供 hooks 与 /stats 命令），另有在对话中渲染详细统计卡片的 /stats 命令。"
   },
   "author": {
-    "name": "yizhiwang",
-    "url": "https://github.com/yizhiwang"
+    "name": "w-PiaoPiao",
+    "url": "https://github.com/w-PiaoPiao"
   },
   "license": "MIT",
   "keywords": [

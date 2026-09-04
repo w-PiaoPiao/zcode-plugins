@@ -1,86 +1,191 @@
-# ZCode 会话统计（session-stats）
+# ZCode Session Stats（会话统计）
 
-在 ZCode 窗口**底部固定一条会话统计悬浮栏**，实时显示当前会话的
-token 用量与性能指标（不依赖输入框/聊天区结构，任何界面状态下都显示）：
+[English](#english) · [中文](#中文)
+
+A **session token & performance stats bar** for the ZCode desktop app, pinned to the
+bottom of the window. It shows real-time token usage and performance metrics of the
+current session — always visible, independent of the chat layout.
+
+为 ZCode 桌面版打造的**会话 token 与性能统计悬浮条**，固定在窗口底部，实时显示
+当前会话的 token 用量与性能指标。**始终显示**，不依赖聊天区布局。
 
 ```
 ● 6 轮 · 159 步 │ LLM 1h 25m │ 首 token 7.2s · 29 tok/s │ 缓存 98% │ 输入 12.39M · 输出 84.0K
+● 6 turns · 159 steps │ LLM 1h 25m │ TTFT 7.2s · 29 tok/s │ cache 98% │ in 12.39M · out 84.0K
 ```
 
-- 左侧圆点：会话有轮次正在进行时呈绿色呼吸；空闲时灰色空心；
-  统计服务未就绪时呈灰色脉动
-- 鼠标悬停任意指标可看精确数值与口径说明
-- 自动跟随 ZCode 明暗主题；窗口变窄时按优先级收缩
-- **始终显示**：daemon 未就绪（如 ZCode 刚重启、守护进程尚未拉起）时
-  显示「会话统计 · 等待本地服务…」，一旦就绪立即显示真实指标，不会消失
-- 另有 `/stats` 斜杠命令，可在对话里让模型渲染一张更详细的统计卡片
+## Features 功能
 
-## 作为 marketplace 安装（hooks / /stats 命令）
+- **Always-on floating bar** pinned to the window bottom — survives React re-renders,
+  session switches, and layout rebuilds.
+  **常驻底部悬浮条**——React 重渲染、切换会话、布局重建都不影响。
+- Shows turns/steps, LLM time, median TTFT, tok/s, cache hit %, cumulative in/out tokens.
+  展示轮/步、LLM 耗时、首 token 中位数、tok/s、缓存命中率、累计输入/输出 token。
+- Green breathing dot while a turn is running; gray while idle; pulsing gray while the
+  local daemon is warming up.
+  轮次进行中圆点绿色呼吸，空闲灰色，本地服务未就绪时灰色脉动。
+- Hover any metric for exact values & definitions. 悬停查看精确值与口径。
+- Follows the ZCode light/dark theme; shrinks gracefully on narrow windows.
+  跟随明暗主题；窄窗口自动收缩。
+- `/stats` slash command renders a detailed stats card in chat.
+  `/stats` 斜杠命令在对话中渲染详细统计卡片。
 
-本仓库是标准 ZCode 插件市场（顶层 `marketplace.json`）。在 ZCode 中：
+---
 
-1. **设置 → 插件管理 → Discover**，点 **`+` 添加市场**，填入本仓库
-   GitHub 地址（`https://github.com/<你的用户名>/<仓库名>`）；
-2. 找到 **session-stats** 插件，点 **Get / 安装**；
-3. 安装后启用，即获得 hooks（会话指针 + daemon 拉起）与 `/stats` 命令。
+## English
 
-> ⚠️ **悬浮条不在 marketplace 机制内**：状态栏需要修改 `ZCode.app` 资源
-> （asar 注入），插件市场机制只分发 manifest 声明的组件，无法做到这一点。
-> 要在本机显示悬浮条，请继续按下方 **安装** 执行一次 `install.sh`。
+### Install from GitHub
 
-## 安装（完整功能，含底部悬浮条）
+#### Option A — Marketplace (hooks + `/stats` command only)
+
+This repo is a standard ZCode plugin marketplace. In ZCode:
+
+1. **Settings → Plugin Management → Discover** → click **`+` (Add marketplace)** and
+   enter the repo URL:
+   `https://github.com/w-PiaoPiao/zcode-plugins`
+2. Find **session-stats** and click **Get / Install**, then enable it.
+
+This gives you the hooks (session pointer + daemon auto-start) and the `/stats`
+command.
+
+> ⚠️ The **status bar itself is NOT installable via the marketplace**: it needs to
+> patch `ZCode.app` resources (asar injection), which the plugin-marketplace mechanism
+> cannot do. To get the floating bar, run Option B once on the machine.
+
+#### Option B — Full install (with the floating bar)
+
+Requires **ZCode desktop** + **Node.js ≥ 22.13** (node:sqlite built-in).
 
 ```bash
+git clone https://github.com/w-PiaoPiao/zcode-plugins.git
+cd zcode-plugins
+bash install.sh
+```
+
+Then **restart ZCode** (Cmd+Q / quit & reopen). The script:
+
+1. Installs the runtime to `~/.zcode/session-stats/` and generates a local access
+   token (`daemon-token`, 0600) shared by daemon / bar / CLI.
+2. Registers hooks (`SessionStart` / `UserPromptSubmit` / `Stop`) and the `/stats`
+   command in `~/.zcode/cli/config.json` + `~/.zcode/commands/stats.md`.
+3. Checks the asar integrity fuse, then injects the status bar into ZCode's
+   `app.asar` (auto-locates it on macOS / Windows / Linux). Original asar is backed up
+   with version metadata; restorable anytime.
+4. Restarts the local stats daemon (`127.0.0.1:47771`, token-gated).
+
+#### Platform support 平台支持
+
+| Platform | Status | Notes |
+|---|---|---|
+| macOS (Intel / Apple Silicon) | ✅ Full | Auto-locates `/Applications/ZCode.app` |
+| Linux (x64 / arm64, Beta) | ✅ Full | Auto-detects install path (`~/.local/share`, `/opt`, …); AppImage must be extracted first |
+| Windows (x64 / arm64) | ✅ Full | Run `bash install.sh` under Git Bash / MSYS2; auto-locates `%LOCALAPPDATA%\Programs\ZCode` |
+
+#### Uninstall / Doctor
+
+```bash
+bash uninstall.sh   # restores app.asar, removes hooks/command, stops daemon
+bash doctor.sh      # one-shot health check (patch, fuse, daemon, data link, CLI)
+```
+
+#### Data source
+
+ZCode desktop already records every model request into
+`~/.zcode/cli/db/db.sqlite`. This plugin only does **read-only** aggregation via
+Node's built-in `node:sqlite` (no external sqlite3 needed on any platform).
+
+| Metric | Definition |
+|---|---|
+| Turns | Distinct `parent_user_message_id` (user-message turns) |
+| Steps | Distinct `logical_request_id` (model requests in the agent loop) |
+| LLM time | Sum of `duration_ms` of completed requests (incl. retries, excl. tool time) |
+| TTFT | **Median** request-level TTFT (robust against retry tails) |
+| tok/s | Total output ÷ (total duration − total TTFT) |
+| Cache | `cache_read / (input + cache_write)` |
+| In / Out | Cumulative tokens (input grows with turns — context is resent every step) |
+
+#### Architecture
+
+```
+hooks(on-event.mjs)─write session pointer─┐
+                                          ▼
+ZCode DB ◄─read-only─ daemon.mjs ──HTTP 127.0.0.1:47771──► floating bar (injected renderer)
+                                          ▲                              │ polls every 1s
+/stats command ─► bin/cli.mjs ───────────┘ (falls back to direct DB)    │ ?session=<active>
+                                                                         ▼
+                                               fixed bottom bar (best-effort taskId probe)
+```
+
+#### Known limitations
+
+- **Re-run `bash install.sh` after every ZCode update** (updates replace `app.asar`).
+  Run `bash doctor.sh` first to confirm state.
+- The patch invalidates the app's code signature; quarantine is auto-removed. If the
+  system still reports "damaged", run:
+  `sudo xattr -rd com.apple.quarantine /Applications/ZCode.app` (macOS only).
+- Right after ZCode launches, before the daemon is up, the bar shows
+  "waiting for local stats service…" and switches to real metrics automatically.
+
+---
+
+## 中文
+
+### 从 GitHub 安装
+
+#### 方式 A — 作为 marketplace 安装（仅 hooks + `/stats` 命令）
+
+本仓库是标准 ZCode 插件市场。在 ZCode 中：
+
+1. **设置 → 插件管理 → Discover** → 点 **`+`（添加市场）**，填入仓库地址：
+   `https://github.com/w-PiaoPiao/zcode-plugins`
+2. 找到 **session-stats**，点 **Get / 安装** 并启用。
+
+安装后获得 hooks（会话指针 + daemon 自动拉起）与 `/stats` 命令。
+
+> ⚠️ **悬浮条本身无法通过 marketplace 安装**：它需要修改 `ZCode.app` 资源
+> （asar 注入），而插件市场机制只能分发 manifest 声明的组件。要显示悬浮条，
+> 请在本机执行一次方式 B。
+
+#### 方式 B — 完整安装（含底部悬浮条）
+
+前置：**ZCode 桌面版** + **Node.js ≥ 22.13**（自带 node:sqlite）。
+
+```bash
+git clone https://github.com/w-PiaoPiao/zcode-plugins.git
+cd zcode-plugins
 bash install.sh
 ```
 
 然后**重启 ZCode**。脚本会：
 
-1. 把运行时装到 `~/.zcode/session-stats/`（排除日志），并生成本地访问 token
-   `daemon-token`（0600，daemon / 状态栏 / CLI 三方共享）
+1. 把运行时装到 `~/.zcode/session-stats/`（排除日志），生成本地访问 token
+   `daemon-token`（0600，daemon / 悬浮条 / CLI 三方共享）
 2. 在 `~/.zcode/cli/config.json` 注册 hooks（SessionStart / UserPromptSubmit / Stop）
    与 `/stats` 命令（`~/.zcode/commands/stats.md`）
-3. 先检查 ZCode 的 asar 完整性 fuse（若已开启则拒绝注入并说明原因），再给
-   ZCode 的 `app.asar` 注入状态栏（macOS 自动定位 `/Applications/ZCode.app`；
-   Windows/Linux 自动探测安装位置）
-   （原文件备份为 `app.asar.zcstats-orig` 并记录版本元数据，可随时还原；
-   发现备份与当前构建不一致时自动刷新备份）
+3. 先检查 asar 完整性 fuse，再把状态栏注入 ZCode 的 `app.asar`
+   （macOS/Windows/Linux 自动定位；原 asar 备份并记录版本，可随时还原）
 4. 重启本地统计守护进程（仅监听 127.0.0.1:47771，带 token 才能读取）
 
-### 平台支持
+#### 平台支持
 
 | 平台 | 支持 | 说明 |
 |---|---|---|
 | macOS（Intel / Apple Silicon） | ✅ 完整 | 自动定位 `/Applications/ZCode.app` |
 | Linux（x64 / arm64，Beta） | ✅ 完整 | 自动探测安装位置（`~/.local/share`、`/opt` 等）；AppImage 需先解包 |
-| Windows（x64 / arm64） | ✅ 完整 | Git Bash / MSYS2 下运行 `bash install.sh`；自动定位 `%LOCALAPPDATA%\Programs\ZCode` |
+| Windows（x64 / arm64） | ✅ 完整 | 在 Git Bash / MSYS2 下运行 `bash install.sh`；自动定位 `%LOCALAPPDATA%\Programs\ZCode` |
 
-前置要求：ZCode 桌面版 + **Node.js ≥ 22.13**（node:sqlite 已默认开启；更早的 22.5+ 需带
-`--experimental-sqlite`，脚本会自动处理）。Windows 无需额外安装 sqlite3——统计查询统一走
-Node 内置的 node:sqlite；外部 sqlite3 仅作为兜底。
-
-## 卸载
+#### 卸载 / 自检
 
 ```bash
-bash uninstall.sh
+bash uninstall.sh   # 还原 app.asar、移除 hooks/命令、停 daemon
+bash doctor.sh      # 一键自检（补丁/fuse/daemon/数据链路/CLI）
 ```
 
-还原 app.asar、移除 hooks 与命令、停掉守护进程并清理运行时（含 token）。重启 ZCode 生效。
-
-## 自检
-
-```bash
-bash doctor.sh
-```
-
-一键检查：补丁状态、fuse、备份与 ZCode 版本是否一致、hooks/命令/token 是否就位、
-daemon 鉴权与数据链路、CLI 输出。ZCode 更新后怀疑插件失效时先跑它。
-
-## 数据从哪来
+#### 数据从哪来
 
 ZCode 桌面版本来就把每次模型请求写进本地数据库
-`~/.zcode/cli/db/db.sqlite`（`model_usage` / `turn_usage` / `tool_usage` 表）。
-本插件只做**只读**聚合（macOS 自带 sqlite3，`mode=ro` 打开，不影响运行中的 ZCode）：
+`~/.zcode/cli/db/db.sqlite`。本插件只做**只读**聚合，统一走 Node 内置
+`node:sqlite`（任何平台都无需外部 sqlite3）。
 
 | 指标 | 口径 |
 |---|---|
@@ -92,63 +197,56 @@ ZCode 桌面版本来就把每次模型请求写进本地数据库
 | 缓存 | `cache_read / (input + cache_write)` |
 | 输入/输出 | 累计 token（输入随轮数增长是正常的——每步都重发上下文） |
 
-## 架构
+#### 架构
 
 ```
 hooks(on-event.mjs)──写会话指针──┐
                                  ▼
-ZCode 数据库 ◄──只读查询── daemon.mjs ──HTTP 127.0.0.1:47771──► 悬浮条(注入渲染器)
-                                 ▲                              │ 每秒轮询
-/stats 命令 ──► bin/cli.mjs ─────┘（守护进程不在时直查数据库）  │ ?session=<当前窗口会话>
-                                                                ▼
-                                     固定底部悬浮条（尽力探测 taskId，失败回退最近活跃）
+ZCode 数据库 ◄──只读── daemon.mjs ──HTTP 127.0.0.1:47771──► 悬浮条(注入渲染器)
+                                 ▲                          │ 每秒轮询
+/stats 命令 ──► bin/cli.mjs ─────┘（daemon 不在时直查库）   │ ?session=<当前会话>
+                                                            ▼
+                                    固定底部悬浮条（尽力探测 taskId，失败回退最近活跃）
 ```
 
-- 状态栏为**固定底部悬浮条**：`position: fixed` 挂载于 body，不依赖输入框/聊天区
-  等业务 DOM，React 重渲染、切换会话、聊天区整体重建都不影响显示；
-  窗口/标签会话通过渲染器组件的 taskId 尽力探测（失败自动回退最近活跃会话）。
-- 本地 HTTP 接口有 token 鉴权（`~/.zcode/session-stats/daemon-token`，0600）并校验
-  Host 头；CORS 只回显请求方 Origin。浏览器里任意网页都无法跨源读取统计
-  （无 token 一律 403），也不受 DNS rebinding 影响。
-- `app-patch/patch-app.mjs` 负责注入：改写 asar 头部（注入 index.html 一行
-  `<script>` + 新增状态栏脚本），流式拷贝原数据后原子替换。
-  注入前会检查 Electron 的 asar 完整性 fuse（实测 ZCode 为关闭状态，
-  补丁可正常启动；若未来版本开启该 fuse，脚本会拒绝注入而不是把 app 打坏）。
-
-## 已知限制
+#### 已知限制
 
 - **ZCode 更新后需重跑 `bash install.sh`**（更新会整体替换 app.asar）。
-  应用设置为不自动更新时无影响。可先跑 `bash doctor.sh` 确认状态。
-- ZCode 刚启动、守护进程尚未被拉起时，悬浮条显示「等待本地服务…」占位；
-  发送一条消息（hook 拉起 daemon）或 daemon 就绪后自动显示真实指标。
-- 补丁使 app 的资源签名封条失效（本地修改的代价）。已自动移除 quarantine
-  隔离属性；若系统仍弹"已损坏"，执行：
-  `sudo xattr -rd com.apple.quarantine /Applications/ZCode.app`
-- 每个窗口/标签显示**自己的**会话统计（状态栏通过渲染器组件的 taskId 定位
-  当前会话）；组件结构变化导致定位失败时，自动回退显示最近活跃的会话。
-- 首个数据点需要该会话至少有一次模型请求记录；新开的空会话显示全 0。
+  可先跑 `bash doctor.sh` 确认状态。
+- 补丁使 app 的资源签名封条失效（本地修改的代价）。已自动移除 quarantine；
+  若系统仍弹"已损坏"，执行：
+  `sudo xattr -rd com.apple.quarantine /Applications/ZCode.app`（仅 macOS）
+- ZCode 刚启动、守护进程尚未就绪时，悬浮条显示「等待本地服务…」，
+  就绪后自动切到真实指标。
 
-## 文件结构
+---
+
+## File structure 文件结构
 
 ```
-marketplace.json             市场清单（ZCode 添加本仓库为市场时读取）
-plugins/session-stats/       插件本体（marketplace 安装的组件包）
-  .zcode-plugin/plugin.json  插件 manifest（hooks + /stats 命令声明）
-  hooks/hooks.json           插件版 hook 声明
-  hooks/on-event.mjs         hook 入口：记会话指针 + 拉起守护进程
-  daemon/daemon.mjs          本地统计守护进程（127.0.0.1:47771，token 鉴权）
-  core/stats-core.mjs        数据库只读聚合
-  bin/cli.mjs                命令行（--json 供 /stats 用）
-  bin/configure.mjs          hooks/命令注册器
-  commands/stats.md          /stats 命令定义
+marketplace.json              Marketplace manifest（ZCode 添加本仓库为市场时读取）
+plugins/session-stats/        Plugin package (components installed by the marketplace)
+  .zcode-plugin/plugin.json   Plugin manifest（hooks + /stats command）
+  hooks/hooks.json            Hook declarations
+  hooks/on-event.mjs          Hook entry: session pointer + daemon autostart
+  daemon/daemon.mjs           Local stats daemon (127.0.0.1:47771, token-gated)
+  core/stats-core.mjs         Read-only DB aggregation (node:sqlite)
+  bin/cli.mjs                 CLI (--json for /stats)
+  bin/configure.mjs           Hooks/command registrar
+  commands/stats.md           /stats command definition
 app-patch/
-  session-stats-bar.js       底部悬浮条 UI（注入渲染器，零依赖 vanilla JS）
-  patch-app.mjs              asar 注入/还原/状态工具（含 fuse 检查与备份元数据）
+  session-stats-bar.js        Floating bar UI (injected renderer, vanilla JS)
+  patch-app.mjs               asar patch/restore/status (fuse check, backup metadata)
 lib/
-  zcenv.sh                   跨平台环境探测（OS/node/asar 定位 + daemon 启停）
-install.sh / uninstall.sh   一键安装/卸载（含 asar 注入，跨平台）
-doctor.sh                   一键自检
-# 运行时产物（install.sh 生成于 ~/.zcode/session-stats/）：
-#   daemon-token               本地 HTTP 访问 token（0600）
-#   current-session.json       当前会话指针（hooks 写入）
+  zcenv.sh                    Cross-platform env detection + daemon lifecycle
+install.sh / uninstall.sh     One-shot install / uninstall (cross-platform)
+doctor.sh                     One-shot health check
 ```
+
+Runtime artifacts (created by `install.sh` in `~/.zcode/session-stats/`):
+`daemon-token` (0600), `current-session.json` (session pointer), `daemon.log`,
+`daemon.pid`, `zcode.pid`.
+
+## License
+
+MIT

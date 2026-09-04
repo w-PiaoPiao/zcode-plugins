@@ -1,13 +1,13 @@
 {
-  "name": "yizhiwang-zcode-plugins",
-  "description": "Personal ZCode plugins marketplace: session token/performance stats bar, /stats command and local stats daemon.",
+  "name": "zcode-plugins",
+  "description": "ZCode plugins marketplace by w-PiaoPiao: session token/performance stats bar, /stats command and local stats daemon.",
   "description_i18n": {
-    "en": "Personal ZCode plugins marketplace: session token/performance stats bar, /stats command and local stats daemon.",
-    "zh-CN": "个人 ZCode 插件市场：会话 token/性能统计悬浮条、/stats 命令与本地统计守护进程。"
+    "en": "ZCode plugins marketplace by w-PiaoPiao: session token/performance stats bar, /stats command and local stats daemon.",
+    "zh-CN": "w-PiaoPiao 的 ZCode 插件市场：会话 token/性能统计悬浮条、/stats 命令与本地统计守护进程。"
   },
   "owner": {
-    "name": "yizhiwang",
-    "url": "https://github.com/yizhiwang"
+    "name": "w-PiaoPiao",
+    "url": "https://github.com/w-PiaoPiao"
   },
   "plugins": [
     {
@@ -21,8 +21,8 @@
       },
       "version": "0.3.0",
       "author": {
-        "name": "yizhiwang",
-        "url": "https://github.com/yizhiwang"
+        "name": "w-PiaoPiao",
+        "url": "https://github.com/w-PiaoPiao"
       },
       "license": "MIT",
       "category": "developer-tools",

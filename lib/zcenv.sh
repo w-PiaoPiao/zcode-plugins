@@ -110,10 +110,15 @@ zc_daemon_stop() {
 
 zc_port_in_use() {
   # 端口 47771 是否已被占用（daemon 在跑）——返回 0 占用 / 1 空闲
+  # 注意：端口空闲时 lsof/fuser 本身返回非零，勿用 "|| 真值" 兜底（会把空闲误判成占用）
   if [[ $IS_WIN -eq 1 ]]; then
     netstat -ano 2>/dev/null | grep -q ":47771 .*LISTENING"
+  elif command -v lsof >/dev/null 2>&1; then
+    lsof -ti tcp:47771 >/dev/null 2>&1
+  elif command -v fuser >/dev/null 2>&1; then
+    fuser 47771/tcp >/dev/null 2>&1
   else
-    lsof -ti tcp:47771 >/dev/null 2>&1 || command -v lsof >/dev/null 2>&1 || return 1
+    return 1 # 无探测工具：按空闲处理（daemon 自带 EADDRINUSE 容错）
   fi
 }
 
