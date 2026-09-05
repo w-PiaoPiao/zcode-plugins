@@ -304,8 +304,10 @@ function ensureComposerSpace() {
 }
 
 // 动态定位：悬浮条放在聊天输入框**下方**的留白区内（输入框通过
-// margin-bottom 腾出 36px 空间），水平方向与输入框对齐居中——互不遮挡。
-// 输入框多行变高时整体上移，悬浮条跟随；输入框不可见时回退贴底居中。
+// margin-bottom 腾出空间），水平方向与输入框对齐居中——互不遮挡。
+// 位置公式：bar 底边 = 留白高度 − bar 自身高度 − 2px 间隙，
+// 即 bar 顶边贴输入框底边下方 2px（diag 实测修正：此前 +2 方向反了且未减
+// bar 高度，导致 bar 整个叠回输入框内部）。
 function placeBar() {
   if (!bar) return;
   try {
@@ -313,8 +315,9 @@ function placeBar() {
     if (composer) {
       const r = composer.getBoundingClientRect();
       if (r.height > 0 && r.bottom > 0 && r.bottom <= window.innerHeight + 40) {
-        // 垂直：紧贴输入框底边之下（留白区内，再留 2px 间隙）
-        bar.style.bottom = Math.max(4, Math.round(window.innerHeight - r.bottom + 2)) + "px";
+        const barH = bar.offsetHeight || 28;
+        const spaceBelow = window.innerHeight - r.bottom; // 输入框底边之下的留白高度
+        bar.style.bottom = Math.max(4, Math.round(spaceBelow - barH - 2)) + "px";
         // 水平：与输入框中心对齐（而非窗口中心）
         bar.style.left = Math.round(r.left + r.width / 2) + "px";
         bar.style.transform = "translateX(-50%)";
