@@ -117,6 +117,20 @@ const server = http.createServer(async (req, res) => {
     res.end();
     return;
   }
+  // 渲染端诊断上报（悬浮条排障用）：把 renderer 内部状态写入 daemon.log
+  if (url.pathname === "/v1/diag" && req.method === "POST") {
+    let body = "";
+    req.on("data", (c) => {
+      body += c;
+      if (body.length > 8192) req.destroy();
+    });
+    req.on("end", () => {
+      log("diag:", body.slice(0, 4000));
+      res.writeHead(204);
+      res.end();
+    });
+    return;
+  }
   if (req.method !== "GET") {
     res.writeHead(405);
     res.end();

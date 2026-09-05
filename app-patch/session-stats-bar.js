@@ -356,6 +356,54 @@ async function tick() {
     setWaitState();
     bar.style.display = "";
   }
+  reportDiag(view);
+}
+
+// 诊断上报（排障用）：把 renderer 内部状态发给 daemon 写日志，每 15s 一次
+let lastDiagAt = 0;
+function reportDiag(view) {
+  const now = Date.now();
+  if (now - lastDiagAt < 15000) return;
+  lastDiagAt = now;
+  try {
+    const composers = [...document.querySelectorAll('[data-testid="v4-composer"]')].map((el, i) => {
+      const r = el.getBoundingClientRect();
+      let computedMB = "";
+      try { computedMB = getComputedStyle(el).marginBottom; } catch {}
+      return {
+        i,
+        top: Math.round(r.top),
+        bottom: Math.round(r.bottom),
+        h: Math.round(r.height),
+        inlineMB: el.style.marginBottom || "",
+        computedMB,
+        visible: !!el.offsetParent,
+      };
+    });
+    const b = bar ? bar.getBoundingClientRect() : null;
+    const pane = document.querySelector('[data-testid="v4-session-pane-workspace-main"]');
+    const payload = JSON.stringify({
+      kind: new URLSearchParams(location.search).get("windowKind"),
+      composerCount: composers.length,
+      composers,
+      bar: b
+        ? {
+            bottomGap: Math.round(window.innerHeight - b.bottom),
+            left: Math.round(b.left),
+            w: Math.round(b.width),
+            h: Math.round(b.height),
+          }
+        : null,
+      settingsOpen: !!document.querySelector('[data-testid="settings-page"]'),
+      paneSessionId: pane ? pane.getAttribute("data-session-id") : null,
+      view,
+    });
+    fetch(`http://127.0.0.1:${DEFAULT_PORT}/v1/diag?t=${encodeURIComponent(TOKEN)}`, {
+      method: "POST",
+      headers: { "Content-Type": "text/plain" }, // 简单请求，免 CORS 预检
+      body: payload,
+    }).catch(() => {});
+  } catch {}
 }
 
 function start() {
