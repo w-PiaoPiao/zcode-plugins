@@ -29,6 +29,9 @@ const CSS = `
   padding: 5px 14px;
   border-radius: 999px;
   background: var(--color-surface, #ffffff);
+  background: color-mix(in srgb, var(--color-surface, #ffffff) 82%, transparent);
+  backdrop-filter: blur(10px);
+  -webkit-backdrop-filter: blur(10px);
   border: 1px solid var(--color-border, #e4e4e7);
   box-shadow: 0 6px 24px rgba(0, 0, 0, 0.08);
   font-size: 11.5px;
@@ -284,6 +287,24 @@ function resolveViewState() {
   return { visible: true, sessionId: DRAFT_SENTINEL };
 }
 
+// 动态定位：悬浮条放在聊天输入框正上方（不遮挡输入控件）。
+// 输入框多行变高时跟随上移；输入框不可见时回退贴底。
+function placeBar() {
+  if (!bar) return;
+  let bottom = 8;
+  try {
+    const composer = document.querySelector('[data-testid="v4-composer"]');
+    if (composer) {
+      const r = composer.getBoundingClientRect();
+      // 输入框可见且顶边在窗口内（排除隐藏态 rect 全 0 的情况）
+      if (r.height > 0 && r.top > 0 && r.top < window.innerHeight - 40) {
+        bottom = Math.max(8, Math.round(window.innerHeight - r.top + 6));
+      }
+    }
+  } catch {}
+  bar.style.bottom = bottom + "px";
+}
+
 // 不再跨会话沿用 lastSessionId 缓存：新建对话/无会话时用 DRAFT_SENTINEL 强制全 0
 async function tick() {
   if (!bar || !bar.isConnected) {
@@ -299,6 +320,7 @@ async function tick() {
     bar.style.display = "none"; // 设置页/非聊天视图 → 隐藏
     return;
   }
+  placeBar();
 
   const data = await fetchStats(view.sessionId);
   if (data) {
@@ -330,6 +352,7 @@ function start() {
 
   setInterval(tick, POLL_MS);
   document.addEventListener("visibilitychange", tick);
+  window.addEventListener("resize", placeBar);
   tick();
 }
 
