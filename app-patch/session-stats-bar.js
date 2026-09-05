@@ -45,6 +45,11 @@ const CSS = `
   -webkit-user-select: none;
   pointer-events: auto;
 }
+/* 给输入框下方留出悬浮条空间：输入框整体上移，下方留白由悬浮条占用
+   （bar 高约 28px：留白 36px = 条体 28 + 上 2 + 下 6） */
+[data-testid="v4-composer"] {
+  margin-bottom: 36px !important;
+}
 /* 窄窗口收缩：tokens 段允许省略 */
 [data-zcstats-bar] .zcstats-seg { display: inline-flex; align-items: baseline; gap: 4px; flex: 0 0 auto; }
 [data-zcstats-bar] .zcstats-seg[data-zcstats-seg="tokens"] { flex: 0 1 auto; min-width: 0; overflow: hidden; }
@@ -287,22 +292,29 @@ function resolveViewState() {
   return { visible: true, sessionId: DRAFT_SENTINEL };
 }
 
-// 动态定位：悬浮条放在聊天输入框正上方（不遮挡输入控件）。
-// 输入框多行变高时跟随上移；输入框不可见时回退贴底。
+// 动态定位：悬浮条放在聊天输入框**下方**的留白区内（输入框通过 CSS
+// margin-bottom 腾出 36px 空间），水平方向与输入框对齐居中——互不遮挡。
+// 输入框多行变高时整体上移，悬浮条跟随；输入框不可见时回退贴底居中。
 function placeBar() {
   if (!bar) return;
-  let bottom = 8;
   try {
     const composer = document.querySelector('[data-testid="v4-composer"]');
     if (composer) {
       const r = composer.getBoundingClientRect();
-      // 输入框可见且顶边在窗口内（排除隐藏态 rect 全 0 的情况）
-      if (r.height > 0 && r.top > 0 && r.top < window.innerHeight - 40) {
-        bottom = Math.max(8, Math.round(window.innerHeight - r.top + 6));
+      if (r.height > 0 && r.bottom > 0 && r.bottom <= window.innerHeight + 40) {
+        // 垂直：紧贴输入框底边之下（留白区内，再留 2px 间隙）
+        bar.style.bottom = Math.max(4, Math.round(window.innerHeight - r.bottom + 2)) + "px";
+        // 水平：与输入框中心对齐（而非窗口中心）
+        bar.style.left = Math.round(r.left + r.width / 2) + "px";
+        bar.style.transform = "translateX(-50%)";
+        return;
       }
     }
   } catch {}
-  bar.style.bottom = bottom + "px";
+  // 回退：窗口底部居中
+  bar.style.left = "50%";
+  bar.style.transform = "translateX(-50%)";
+  bar.style.bottom = "8px";
 }
 
 // 不再跨会话沿用 lastSessionId 缓存：新建对话/无会话时用 DRAFT_SENTINEL 强制全 0
