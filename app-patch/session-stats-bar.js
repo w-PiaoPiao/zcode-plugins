@@ -292,7 +292,18 @@ function resolveViewState() {
   return { visible: true, sessionId: DRAFT_SENTINEL };
 }
 
-// 动态定位：悬浮条放在聊天输入框**下方**的留白区内（输入框通过 CSS
+// 给输入框下方腾出悬浮条空间：内联样式优先级最高、必定生效。
+// React 重渲染可能清掉非受控内联属性，因此每次 tick 幂等补设。
+function ensureComposerSpace() {
+  try {
+    const composer = document.querySelector('[data-testid="v4-composer"]');
+    if (composer && composer.style.marginBottom !== "36px") {
+      composer.style.marginBottom = "36px";
+    }
+  } catch {}
+}
+
+// 动态定位：悬浮条放在聊天输入框**下方**的留白区内（输入框通过
 // margin-bottom 腾出 36px 空间），水平方向与输入框对齐居中——互不遮挡。
 // 输入框多行变高时整体上移，悬浮条跟随；输入框不可见时回退贴底居中。
 function placeBar() {
@@ -332,6 +343,7 @@ async function tick() {
     bar.style.display = "none"; // 设置页/非聊天视图 → 隐藏
     return;
   }
+  ensureComposerSpace(); // 先保证输入框下方有留白，再定位悬浮条
   placeBar();
 
   const data = await fetchStats(view.sessionId);
