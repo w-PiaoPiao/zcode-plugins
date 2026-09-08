@@ -36,23 +36,61 @@ mkdir -p "$RUNTIME_DIR"
 ( cd "$PLUGIN_DIR" && tar cf - --exclude='daemon.log*' --exclude='.zcode-plugin' . ) | ( cd "$RUNTIME_DIR" && tar xf - )
 rm -rf "$RUNTIME_DIR/.zcode-plugin"   # 运行时副本不需要插件 manifest（hooks 走 config.json）
 
-zc_log "生成本地访问 token"
-# 跨平台生成 64 hex：优先 node（三平台都有），od -An -tx1 在 Windows Git Bash 也可用
-TOKEN="$("$NODE_BIN" -e 'console.log(require("crypto").randomBytes(32).toString("hex"))')"
-[[ -n "$TOKEN" ]] || die "生成 token 失败"
-( umask 077; printf '%s\n' "$TOKEN" > "$RUNTIME_DIR/daemon-token" )
+# ---------- 1b. token：优先复用已有的 ----------
+# 免补丁（NODE_OPTIONS）路线的注入器在运行时读 token，asar 补丁路线则把 token 烘焙进
+# asar——若每次安装都重新生成 token，已打补丁的 asar 里的旧 token 会立刻失效（403）。
+# 所以只有 token 文件不存在时才生成新 token。
+if [[ -f "$RUNTIME_DIR/daemon-token" ]]; then
+  TOKEN="$(cat "$RUNTIME_DIR/daemon-token")"
+  zc_log "复用已有访问 token"
+else
+  zc_log "生成本地访问 token"
+  # 跨平台生成 64 hex：优先 node（三平台都有），od -An -tx1 在 Windows Git Bash 也可用
+  TOKEN="$("$NODE_BIN" -e 'console.log(require("crypto").randomBytes(32).toString("hex"))')"
+  [[ -n "$TOKEN" ]] || die "生成 token 失败"
+  ( umask 077; printf '%s\n' "$TOKEN" > "$RUNTIME_DIR/daemon-token" )
+fi
 
 # ---------- 2. hooks + 命令 ----------
 zc_log "注册 hooks 与 /stats 命令"
 "$NODE_BIN" "$RUNTIME_DIR/bin/configure.mjs" install \
   --runtime "$RUNTIME_DIR" --node "$NODE_BIN" --zcode-dir "$ZCODE_DIR"
 
-# ---------- 3. 注入 app.asar（含 fuse 检查） ----------
-zc_log "注入状态栏到 app.asar"
-"$NODE_BIN" "$APP_PATCH_DIR/patch-app.mjs" patch --asar "$ZC_ASAR" \
-  --bar "$APP_PATCH_DIR/session-stats-bar.js" --token "$TOKEN"
-# 记录实际注入的 asar 路径，卸载时据此还原（AppImage 等场景重定位可能失败）
-printf '%s\n' "$ZC_ASAR" > "$RUNTIME_DIR/.installed-asar"
+# ---------- 3. 渲染端注入：asar 补丁（免补丁路线见下注） ----------
+# 曾实现过 NODE_OPTIONS=--require 注入主进程的免补丁路线（fuse node_options=ENABLE
+# 时自动启用），但实测被 Electron 否决：打包应用强制过滤大多数 NODE_OPTIONs
+# （node_bindings.cc: "Most NODE_OPTIONs are not supported in packaged apps"），
+# --require 直接被忽略，主进程不会加载。故 asar 补丁是当前唯一可行路线；
+# no-patch 分支保留，供未来 Electron 放开限制后用 ZC_STATS_MODE=no-patch 显式启用。
+MODE="${ZC_STATS_MODE:-patch}"
+if [[ "$MODE" == "auto" ]]; then
+  MODE="patch"
+fi
+# 记录本次选择的路线（doctor 据此判断渲染端来源）
+printf '%s\n' "$MODE" > "$RUNTIME_DIR/.inject-mode"
+
+if [[ "$MODE" == "no-patch" ]]; then
+  zc_log "渲染端注入路线：NODE_OPTIONS 免补丁（fuse node_options=ENABLE）"
+  mkdir -p "$RUNTIME_DIR/bar"
+  cp "$APP_PATCH_DIR/session-stats-bar.js" "$RUNTIME_DIR/bar/session-stats-bar.js"
+  cp "$APP_PATCH_DIR/inject-main.cjs" "$RUNTIME_DIR/inject-main.cjs"
+  "$NODE_BIN" "$APP_PATCH_DIR/set-node-options.mjs" install --require-file "$RUNTIME_DIR/inject-main.cjs"
+  zc_log "重启 ZCode 后悬浮条出现；ZCode 更新后无需重新安装"
+else
+  zc_log "渲染端注入路线：asar 补丁（node_options fuse 关闭或显式指定）"
+  if zc_needs_elevation; then
+    # asar 目录不可写（如 Windows Program Files）：提权辅助脚本接管（一次 UAC），
+    # 等待 ZCode 退出后打补丁并自动重启 ZCode；即使本脚本随终端退出中断，补丁仍会完成
+    if ! zc_elevated_patch "$TOKEN"; then
+      die "asar 注入未完成（悬浮条不会出现）。其余组件已就绪且幂等，修复后重跑 bash install.sh 即可。"
+    fi
+  else
+    "$NODE_BIN" "$APP_PATCH_DIR/patch-app.mjs" patch --asar "$ZC_ASAR" \
+      --bar "$APP_PATCH_DIR/session-stats-bar.js" --token "$TOKEN"
+  fi
+  # 记录实际注入的 asar 路径，卸载时据此还原（AppImage 等场景重定位可能失败）
+  printf '%s\n' "$ZC_ASAR" > "$RUNTIME_DIR/.installed-asar"
+fi
 
 # 4b. 移除 quarantine（仅 macOS；win/linux no-op）
 zc_os_quarantine_rm

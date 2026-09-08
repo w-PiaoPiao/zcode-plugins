@@ -47,6 +47,11 @@ zc_find_node() {
     done
   fi
   [[ -n "$NODE_BIN" ]] || zc_die "未找到 node，请先安装 Node.js ≥ 22.5（建议 ≥ 22.13），或把 node 加入 PATH"
+  # Windows Git Bash 下 command -v node 返回无 .exe 后缀的路径（如 /c/.../node），
+  # 而 Windows 文件系统里真实文件名是 node.exe；补全后缀，否则 node/existsSync 都会失败
+  if [[ $IS_WIN -eq 1 && "$NODE_BIN" != *.exe && -x "${NODE_BIN}.exe" ]]; then
+    NODE_BIN="${NODE_BIN}.exe"
+  fi
   NODE_BIN="$(cd "$(dirname "$NODE_BIN")" && pwd)/$(basename "$NODE_BIN")"  # 归一为绝对路径
 }
 
@@ -59,7 +64,9 @@ zc_locate_asar() {
     cands=("/Applications/ZCode.app/Contents/Resources/app.asar")
   elif [[ $IS_WIN -eq 1 ]]; then
     cands=("${LOCALAPPDATA:-$HOME/AppData/Local}/Programs/ZCode/resources/app.asar"
-           "$HOME/AppData/Local/Programs/ZCode/resources/app.asar")
+           "$HOME/AppData/Local/Programs/ZCode/resources/app.asar"
+           "/c/Program Files/ZCode/resources/app.asar"
+           "/c/Program Files (x86)/ZCode/resources/app.asar")
   elif [[ $IS_LINUX -eq 1 ]]; then
     cands=("$HOME/.local/share/ZCode/resources/app.asar"
            "$HOME/.local/share/zcode/resources/app.asar"
@@ -78,7 +85,98 @@ zc_locate_asar() {
       return 0
     fi
   done
+  # --soft：探测失败仅返回 1（自检场景要继续跑后续检查项）；默认 die（安装场景）
+  if [[ "${1:-}" == "--soft" ]]; then
+    return 1
+  fi
   zc_die "未找到 ZCode 的 app.asar（已探测常见安装位置）。请确认 ZCode 桌面版已安装；Linux AppImage 需先 --appimage-extract 或安装 .deb/.rpm。"
+}
+
+# ---------- 提权打补丁（Windows/Program Files 场景） ----------
+# 探测 asar 所在目录是否可直接写；不可写（如 Program Files）则打补丁需要管理员
+zc_needs_elevation() {
+  local probe
+  probe="$(dirname "$ZC_ASAR")/.zcstats-write-probe"
+  if ( : > "$probe" ) 2>/dev/null; then
+    rm -f "$probe" 2>/dev/null
+    return 1   # 可写，无需提权
+  fi
+  return 0     # 不可写，需要提权
+}
+
+# 生成提权辅助脚本并启动（一次 UAC）：等待全部 ZCode* 进程退出 → 打补丁（重试逻辑在
+# patch-app.mjs 内）→ 经 explorer.exe 以普通权限自动重启 ZCode。
+# Windows 不允许替换打开中的 app.asar，所以"补丁"必须同时满足"ZCode 退出 + 管理员"两个
+# 条件；等待退出也由辅助脚本接管，用户只需在方便时正常关闭 ZCode。
+zc_elevated_patch() {
+  local token="$1"
+  # 自给自足：app-patch 目录从 zcenv.sh 自身位置推导（../app-patch），
+  # 不依赖调用方（install.sh）设置的全局变量——install.sh 之外单独调用也不会错
+  local app_patch_dir="${APP_PATCH_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/app-patch}"
+  local helper="$RUNTIME_DIR/patch-helper.cmd"
+  local helper_win log_win node_win mjs_win asar_win bar_win exe_win
+  helper_win="$(cygpath -w "$helper")"
+  log_win="$(cygpath -w "$RUNTIME_DIR/patch-elevated.log")"
+  node_win="$(cygpath -w "$NODE_BIN")"
+  mjs_win="$(cygpath -w "$app_patch_dir/patch-app.mjs")"
+  asar_win="$(cygpath -w "$ZC_ASAR")"
+  bar_win="$(cygpath -w "$app_patch_dir/session-stats-bar.js")"
+  exe_win="$(cygpath -w "$(dirname "$(dirname "$ZC_ASAR")")/ZCode.exe")"
+
+  cat > "$helper" <<EOF
+@echo off
+setlocal
+echo [%date% %time%] waiting for all ZCode* processes to exit... > "$log_win"
+set /a tries=0
+:waitloop
+tasklist /FI "IMAGENAME eq ZCode*" 2>nul | find /I "ZCode" >nul
+if errorlevel 1 goto dopatch
+set /a tries+=1
+if %tries% GEQ 1800 goto timeout
+set /a mod=tries %% 30
+if "%mod%"=="0" echo [%date% %time%] still waiting (%tries%) >> "$log_win"
+ping -n 3 127.0.0.1 >nul
+goto waitloop
+:dopatch
+echo [%date% %time%] ZCode exited, patching... >> "$log_win"
+"$node_win" "$mjs_win" patch --asar "$asar_win" --bar "$bar_win" --token $token >> "$log_win" 2>&1
+set rc=%ERRORLEVEL%
+if "%rc%"=="0" start "" explorer.exe "$exe_win"
+echo [%date% %time%] done exit=%rc% >> "$log_win"
+exit /b %rc%
+:timeout
+echo timed out after 60min waiting for ZCode to exit >> "$log_win"
+exit /b 1
+EOF
+
+  zc_log "asar 目录需要管理员权限：请在弹出的 UAC 窗口点「是」"
+  zc_log "若 ZCode 正在运行，关掉它即可——补丁在后台隐藏窗口中执行，会自动重启 ZCode"
+  # 不用 -Wait：install.sh 若一直阻塞等用户关 ZCode，会被外层超时连带杀死整棵进程树
+  # （实测：helper 也跟着被杀）。Start-Process 启动后立即返回，helper 独立等待，
+  # UAC 被取消时这里仍会同步报错。-WindowStyle Hidden：不给误关窗口的机会，
+  # 存活与否看 patch-elevated.log 的心跳行。
+  : > "$RUNTIME_DIR/patch-elevated.log" 2>/dev/null || true
+  if ! powershell -NoProfile -Command "Start-Process -FilePath '$helper_win' -Verb RunAs -WindowStyle Hidden" 2>/dev/null; then
+    zc_warn "提权被取消或失败，可重新执行 install.sh，或以管理员身份手动运行："
+    zc_warn "  $helper"
+    return 1
+  fi
+  # 限时轮询结果：ZCode 未运行时补丁几秒内完成；仍在运行则交还控制权，
+  # 由 helper 自主等待退出→打补丁→重启，结果事后可用 doctor.sh 核查
+  local i
+  for i in $(seq 1 20); do
+    sleep 1
+    if grep -q "done exit=0" "$RUNTIME_DIR/patch-elevated.log" 2>/dev/null; then
+      return 0
+    fi
+    if grep -q "done exit=[^0]" "$RUNTIME_DIR/patch-elevated.log" 2>/dev/null; then
+      zc_warn "补丁失败，详见 $RUNTIME_DIR/patch-elevated.log"
+      return 1
+    fi
+  done
+  zc_log "补丁转入后台等待：关闭 ZCode 即自动完成并重启 ZCode，无需盯守"
+  zc_log "完成后可用 bash doctor.sh 验证（\"app.asar 已注入状态栏\"即成功）"
+  return 0
 }
 
 # ---------- daemon 启停 ----------
@@ -98,7 +196,8 @@ zc_daemon_stop() {
   # 旧版 daemon 不写 daemon.pid：按监听端口定位并停止（macOS/Linux 用 lsof，Windows 用 netstat）
   if [[ $IS_WIN -eq 1 ]]; then
     local pid
-    pid="$(netstat -ano 2>/dev/null | awk '$4 ~ /:47771$/ && $NF!="0" {print $NF; exit}')"
+    # netstat -ano 列序：Proto(1) Local(2) Foreign(3) State(4) PID(5)——本地地址在第 2 列
+    pid="$(netstat -ano 2>/dev/null | awk '$2 ~ /:47771$/ && $NF!="0" {print $NF; exit}')"
     [[ -n "$pid" ]] && { taskkill //PID "$pid" //F >/dev/null 2>&1 || true; }
   else
     local pid
@@ -143,6 +242,7 @@ zc_daemon_start() {
     const child = spawn(process.execPath, [path.join(rt, "daemon", "daemon.mjs")], {
       detached: true,
       stdio: ["ignore", out, out],
+      windowsHide: true, // Windows：不加会闪出 daemon 的控制台窗口
       env: { ...process.env, ZC_STATS_ASAR: asar },
     });
     child.unref();
