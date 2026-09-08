@@ -22,7 +22,14 @@ else
   zc_log "未发现 app.asar 备份，跳过还原"
 fi
 
-# ---------- 2. 移除 hooks 与命令 ----------
+# ---------- 2. 移除 NODE_OPTIONS 免补丁路线 ----------
+zc_log "移除用户级 NODE_OPTIONS 注入项"
+if [[ -f "$SRC_DIR/app-patch/set-node-options.mjs" ]]; then
+  "$NODE_BIN" "$SRC_DIR/app-patch/set-node-options.mjs" remove \
+    --require-file "$RUNTIME_DIR/inject-main.cjs" 2>/dev/null || true
+fi
+
+# ---------- 3. 移除 hooks 与命令 ----------
 zc_log "移除 hooks 与 /stats 命令"
 # 优先用运行时里的 configure.mjs（可能在 ~/.zcode），否则用源码里的
 if [[ -f "$RUNTIME_DIR/bin/configure.mjs" ]]; then
