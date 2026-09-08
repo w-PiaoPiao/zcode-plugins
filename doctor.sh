@@ -15,6 +15,11 @@ CONFIG="$ZCODE_DIR/cli/config.json"
 TOKEN_FILE="$RUNTIME_DIR/daemon-token"
 PORT="${ZC_STATS_PORT:-47771}"
 
+# 免补丁路线是否已配置（用户级 NODE_OPTIONS 带 inject-main.cjs）
+UOPT="$(powershell -NoProfile -Command "[Environment]::GetEnvironmentVariable('NODE_OPTIONS','User')" 2>/dev/null || true)"
+B_ACTIVE=0
+[[ "$UOPT" == *inject-main.cjs* ]] && B_ACTIVE=1
+
 ok()   { printf '  \033[1;32m✔\033[0m %s\n' "$*"; }
 bad()  { printf '  \033[1;31m✘\033[0m %s\n' "$*"; }
 info() { printf '  \033[1;33m!\033[0m %s\n' "$*"; }
@@ -27,7 +32,7 @@ sec "1. app 补丁与 fuse"
 if [[ -z "$NODE_BIN" ]]; then
   bad "未找到 node，无法检查补丁"
   FAILS=$((FAILS+1))
-elif zc_locate_asar 2>/dev/null; then
+elif zc_locate_asar --soft 2>/dev/null; then
   ST="$("$NODE_BIN" "$SRC_DIR/app-patch/patch-app.mjs" status --asar "$ZC_ASAR" 2>/dev/null || true)"
   if [[ -z "$ST" ]]; then
     bad "无法读取补丁状态（patch-app.mjs status 失败）"
@@ -44,6 +49,8 @@ elif zc_locate_asar 2>/dev/null; then
     ' "$ST")"
     if [[ "$PATCHED" == "1" ]]; then
       ok "app.asar 已注入状态栏 ($ZC_ASAR)"
+    elif [[ "$B_ACTIVE" == "1" ]]; then
+      info "asar 未注入 —— 渲染端走 NODE_OPTIONS 免补丁路线（正常）"
     else
       bad "app.asar 未注入 —— 状态栏不会显示，请重跑 install.sh"
       FAILS=$((FAILS+1))
@@ -86,6 +93,10 @@ CHECK_DESC="hook 入口 on-event.mjs 存在";             check test -f "$RUNTIM
 CHECK_DESC="hooks 已注册（config.json 含标记）";      check grep -q "zc-session-stats" "$CONFIG"
 CHECK_DESC="/stats 命令已安装";                       check test -f "$ZCODE_DIR/commands/stats.md"
 CHECK_DESC="cli.mjs 存在";                            check test -f "$RUNTIME_DIR/bin/cli.mjs"
+if [[ "$B_ACTIVE" == "1" ]]; then
+  CHECK_DESC="NODE_OPTIONS 免补丁路线已配置（用户级）";  check test -f "$RUNTIME_DIR/inject-main.cjs"
+  CHECK_DESC="悬浮条源码就位（bar/session-stats-bar.js）"; check test -f "$RUNTIME_DIR/bar/session-stats-bar.js"
+fi
 if [[ -f "$TOKEN_FILE" ]]; then
   # Windows 无 POSIX 权限位，跳过权限检查
   if [[ $IS_WIN -eq 1 ]]; then
