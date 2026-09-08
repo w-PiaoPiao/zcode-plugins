@@ -58,6 +58,9 @@ if (USE_NODE_SQLITE) {
 function querySqlNode(dbPath, statements) {
   const db = new DatabaseSync(`file:${dbPath}?mode=ro`, { readOnly: true });
   try {
+    // ZCode 运行中会写库，Windows 上并发比 macOS 严格，读前先给足等待避免
+    // "database is locked"（daemon.log 已实际出现过）
+    db.exec("PRAGMA busy_timeout = 5000");
     return statements.map((sql) => db.prepare(sql).all());
   } finally {
     db.close();
@@ -72,7 +75,7 @@ async function snapshotDb(dbPath) {
     await pExecFile(
       SQLITE_BIN,
       ["-cmd", ".timeout 2000", `file:${dbPath}?mode=ro`, `.backup ${tmp}`],
-      { timeout: 8000 }
+      { timeout: 8000, windowsHide: true }
     );
     return tmp;
   } catch {
@@ -101,6 +104,7 @@ async function querySql(dbPath, statements) {
     const { stdout } = await pExecFile(SQLITE_BIN, args, {
       maxBuffer: 16 * 1024 * 1024,
       timeout: 8000,
+      windowsHide: true,
     });
     return parseMultiJson(stdout);
   } catch (err) {
@@ -110,7 +114,7 @@ async function querySql(dbPath, statements) {
       const { stdout } = await pExecFile(
         SQLITE_BIN,
         ["-json", "-cmd", ".timeout 2000", snap, ...statements],
-        { maxBuffer: 16 * 1024 * 1024, timeout: 8000 }
+        { maxBuffer: 16 * 1024 * 1024, timeout: 8000, windowsHide: true }
       );
       return parseMultiJson(stdout);
     } finally {
