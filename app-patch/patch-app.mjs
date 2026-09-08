@@ -15,6 +15,7 @@
 import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
+import { execFileSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
 const DEFAULT_ASAR = "/Applications/ZCode.app/Contents/Resources/app.asar";
@@ -32,11 +33,55 @@ const FUSE_INTEGRITY_INDEX = 4; // EnableEmbeddedAsarIntegrityValidation
 const FUSE_ONLY_ASAR_INDEX = 5; // OnlyLoadAppFromAsar
 const FUSE_STATE = { 48: "DISABLE", 49: "ENABLE", 114: "REMOVED", 144: "INHERIT" };
 
-function argValue(argv, name) {
+const argValue = (argv, name) => {
   const i = argv.indexOf(name);
   return i >= 0 ? argv[i + 1] : undefined;
-}
+};
 const hasFlag = (argv, name) => argv.includes(name);
+
+const sleep = (ms) => Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+
+// rename 失败时的占用者线索：Windows 下替换"被打开着的"app.asar 必 EPERM，
+// 列出当时仍在运行的 ZCode* 进程（含 crashpad/隐藏后台窗口），便于定位占用者
+function zcodeProcessHint() {
+  if (process.platform !== "win32") return "";
+  try {
+    const out = execFileSync("tasklist", ["/FI", "IMAGENAME eq ZCode*", "/FO", "CSV", "/NH"], {
+      encoding: "utf8",
+      timeout: 5000,
+      windowsHide: true,
+    });
+    return `\nstill-running ZCode* processes at failure:\n${out.trim()}`;
+  } catch {
+    return "";
+  }
+}
+
+// Windows 不允许替换被打开的文件：本进程遗留句柄、杀软对新写完的大 tmp 的瞬时扫描、
+// 未退净的后台窗口都会让一次性 rename 失败。瞬时段持靠退避重试穿过，重试耗尽才报错。
+function renameWithRetry(from, to) {
+  let lastErr;
+  for (let i = 0; i < 12; i++) {
+    try {
+      fs.renameSync(from, to);
+      return;
+    } catch (err) {
+      if (!["EPERM", "EBUSY", "EACCES"].includes(err.code)) throw err;
+      lastErr = err;
+      sleep(Math.min(500 * 2 ** i, 5000));
+    }
+  }
+  throw new Error(`${lastErr.message}${zcodeProcessHint()}`);
+}
+
+// Windows 只读属性会让 rename 替换必败（管理员也一样），先摘除
+function ensureWritable(p) {
+  if (process.platform !== "win32") return;
+  try {
+    const st = fs.statSync(p);
+    if (!(st.mode & 0o222)) fs.chmodSync(p, st.mode | 0o222);
+  } catch {}
+}
 
 // ---------- asar 头部 ----------
 // 布局（经实测校准）：
@@ -221,6 +266,7 @@ function cmdPatch(argv) {
   const backupPath = asarPath + BACKUP_SUFFIX;
 
   if (!fs.existsSync(asarPath)) throw new Error(`app.asar not found: ${asarPath}`);
+  ensureWritable(asarPath);
 
   const fuse = checkFuses(asarPath);
   console.log(`fuse check: ${fuse.status}${fuse.reason ? ` (${fuse.reason})` : ""}`);
@@ -271,6 +317,7 @@ function cmdPatch(argv) {
   }
 
   const srcFd = fs.openSync(asarPath, "r");
+  let srcFdOpen = true;
   try {
     const { header, dataStart } = readHeader(srcFd);
 
@@ -353,15 +400,18 @@ function cmdPatch(argv) {
     }
 
     // 6. 原子替换 + 保留权限
+    // Windows：替换前先关掉自己持有的源句柄（POSIX 允许替换打开中的文件，Windows 不允许）
+    fs.closeSync(srcFd);
+    srcFdOpen = false;
     const mode = fs.statSync(asarPath).mode;
     fs.chmodSync(tmpPath, mode);
-    fs.renameSync(tmpPath, asarPath);
+    renameWithRetry(tmpPath, asarPath);
     console.log(
       `patched ok: +${barSize}B bar, index.html ${indexEntry ? "rewritten" : ""}, total ${(totalSize / 1048576).toFixed(1)}MB -> ${asarPath}`
     );
     console.log("restart ZCode to see the stats bar.");
   } finally {
-    fs.closeSync(srcFd);
+    if (srcFdOpen) fs.closeSync(srcFd);
   }
 }
 
@@ -380,9 +430,10 @@ function cmdRestore(argv) {
     console.warn(`!! 备份来自 ZCode ${meta.zcodeVersion}，当前为 ${currentVersion} —— 还原可能造成版本错配，请确认`);
   }
   const tmpPath = asarPath + ".zcstats-restore-tmp";
+  ensureWritable(asarPath);
   fs.copyFileSync(backupPath, tmpPath);
   fs.chmodSync(tmpPath, fs.statSync(asarPath).mode);
-  fs.renameSync(tmpPath, asarPath);
+  renameWithRetry(tmpPath, asarPath);
   if (hasFlag(argv, "--purge")) {
     fs.rmSync(backupPath, { force: true });
     fs.rmSync(asarPath + META_SUFFIX, { force: true });
