@@ -77,6 +77,7 @@ async function ensureDaemon() {
     const child = spawn(process.execPath, args, {
       detached: true,
       stdio: "ignore",
+      windowsHide: true, // Windows：不加会给 daemon 分配可见控制台窗口（hook 触发时闪一下）
       env: asar ? { ...process.env, ZC_STATS_ASAR: asar } : process.env,
     });
     child.unref();

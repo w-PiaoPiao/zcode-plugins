@@ -215,7 +215,11 @@ setInterval(async () => {
 // ZCode 是否在运行（跨平台实时检测）
 async function zcodeRunning() {
   if (process.platform === "win32") {
-    const { stdout } = await pExecFile2("tasklist", ["/FI", "IMAGENAME eq ZCode.exe", "/NH"]);
+    // windowsHide 必须加：daemon 是无控制台的后台进程，spawn 控制台程序会每 30s
+    // 闪出一个 cmd 窗口（macOS 开发时不存在此问题，Windows 上极度影响使用）
+    const { stdout } = await pExecFile2("tasklist", ["/FI", "IMAGENAME eq ZCode.exe", "/NH"], {
+      windowsHide: true,
+    });
     return /ZCode\.exe/i.test(stdout);
   }
   // macOS/Linux：renderer 进程的命令行带 <app>/Resources/app.asar 的 --app-path，
