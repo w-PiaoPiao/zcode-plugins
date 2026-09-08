@@ -79,7 +79,22 @@ Then **restart ZCode** (Cmd+Q / quit & reopen). The script:
 |---|---|---|
 | macOS (Intel / Apple Silicon) | ✅ Full | Auto-locates `/Applications/ZCode.app` |
 | Linux (x64 / arm64, Beta) | ✅ Full | Auto-detects install path (`~/.local/share`, `/opt`, …); AppImage must be extracted first |
-| Windows (x64 / arm64) | ✅ Full | Run `bash install.sh` under Git Bash / MSYS2; auto-locates `%LOCALAPPDATA%\Programs\ZCode` |
+| Windows (x64 / arm64) | ✅ Full | Run `bash install.sh` under Git Bash / MSYS2; auto-locates `%LOCALAPPDATA%\Programs\ZCode` and `C:\Program Files\ZCode` |
+
+#### Windows notes
+
+- ZCode installed under `C:\Program Files` needs **administrator rights** to patch
+  `app.asar`. `install.sh` handles it automatically: approve **one UAC prompt**, then a
+  hidden helper waits for all ZCode processes to exit, applies the patch (with retry
+  against transient locks), and relaunches ZCode with normal privileges. You only need
+  to quit ZCode whenever convenient.
+- Per-user installs (`%LOCALAPPDATA%\Programs\ZCode`) need no elevation at all.
+- All renderer-side child processes (the 30s `tasklist` liveness probe, daemon spawn,
+  sqlite3 fallback) are spawned with `windowsHide`, so no console windows flash.
+- A no-patch route via `NODE_OPTIONS=--require` was investigated and is **not feasible**:
+  Electron filters most `NODE_OPTIONs` in packaged apps
+  (`node_bindings.cc: "Most NODE_OPTIONs are not supported in packaged apps"`), so the
+  main process never loads the injected module — even with the `node_options` fuse enabled.
 
 #### Uninstall / Doctor
 
@@ -172,7 +187,19 @@ bash install.sh
 |---|---|---|
 | macOS（Intel / Apple Silicon） | ✅ 完整 | 自动定位 `/Applications/ZCode.app` |
 | Linux（x64 / arm64，Beta） | ✅ 完整 | 自动探测安装位置（`~/.local/share`、`/opt` 等）；AppImage 需先解包 |
-| Windows（x64 / arm64） | ✅ 完整 | 在 Git Bash / MSYS2 下运行 `bash install.sh`；自动定位 `%LOCALAPPDATA%\Programs\ZCode` |
+| Windows（x64 / arm64） | ✅ 完整 | 在 Git Bash / MSYS2 下运行 `bash install.sh`；自动定位 `%LOCALAPPDATA%\Programs\ZCode` 与 `C:\Program Files\ZCode` |
+
+#### Windows 说明
+
+- ZCode 装在 `C:\Program Files` 时，打补丁需要**管理员权限**。`install.sh` 已自动处理：
+  批准**一次 UAC**后，后台隐藏辅助脚本会等待所有 ZCode 进程退出 → 打补丁（带重试，
+  可穿过杀软瞬时锁）→ 以普通权限自动重启 ZCode。你只需在方便时正常关闭 ZCode。
+- 用户级安装（`%LOCALAPPDATA%\Programs\ZCode`）全程无需提权。
+- 渲染端所有子进程调用（每 30s 的 `tasklist` 探活、daemon 拉起、sqlite3 兜底）均已加
+  `windowsHide`，不会闪 cmd 窗口。
+- `NODE_OPTIONS=--require` 免补丁路线已验证**不可行**：Electron 对打包应用过滤大多数
+  NODE_OPTIONs（`node_bindings.cc: "Most NODE_OPTIONs are not supported in packaged apps"`），
+  即使 `node_options` fuse 开启，主进程也不会加载注入模块。
 
 #### 卸载 / 自检
 
