@@ -85,7 +85,7 @@ function pretty(s) {
     ].join("  |  ")
   );
   lines.push(
-    `工具调用 ${t.toolCalls} 次（失败 ${t.toolErrors}）· 请求 ${t.attempts} 次（重试 ${t.retries}）· 模型 ${t.model || "—"} · 上下文 ≈ ${fmtTokens(t.contextTokens)} tok`
+    `工具调用 ${t.toolCalls} 次（失败 ${t.toolErrors}${t.toolMs != null ? `，用时 ${fmtDur(t.toolMs)}` : ""}）· 请求 ${t.attempts} 次（重试 ${t.retries}）· 模型 ${t.model || "—"} · 上下文 ≈ ${fmtTokens(t.contextTokens)} tok`
   );
   if (s.turns?.length) {
     lines.push("");

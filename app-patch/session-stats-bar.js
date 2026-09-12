@@ -1,12 +1,17 @@
-// session-stats-bar.js — 注入 ZCode 渲染器的会话统计悬浮条（固定底部）
+// session-stats-bar.js — 注入 ZCode 渲染器的会话统计条（双 pill + 点击弹层）
 //
 // 由 patch-app.mjs 注入 index.html（<script type="module" src="./assets/session-stats-bar.js">）。
 // 职责：
-//   1. 在窗口底部固定一条会话统计（不依赖 chat-composer 等任何业务锚点，
-//      React 重渲染/切换会话/整体布局重建都不会让它消失）
-//   2. 每秒从本地统计守护进程（127.0.0.1:47771/v1/stats）拉取数据并渲染
+//   1. 在输入框下方留白区渲染两个独立统计 pill（对齐 DeepSeek Harness 官方
+//      「双图标 pill + 双弹层」设计）：
+//        - 仪表盘 pill：N 轮 M 步 · X tok/s，点击打开「会话统计」弹层
+//        - 数据库 pill：紧凑总量 tok · 缓存命中 P%，点击打开「Token 用量」弹层
+//   2. 每秒从本地统计守护进程（127.0.0.1:47771/v1/stats）拉取数据并渲染，
+//      弹层打开期间随轮询同步刷新
 //   3. daemon 未就绪（如 ZCode 刚重启、hook 尚未拉起 daemon）时显示等待占位，
 //      一旦就绪立即显示真实指标 —— 永不隐藏
+// 弹层交互对齐官方 stat-dialog 模块：portal 到 body、锚定触发器上方、
+// 点击外部/Escape 关闭、两个弹层互斥（同一时刻至多开一个）。
 // 数据由 session-stats 插件的守护进程从 ~/.zcode/cli/db/db.sqlite 聚合而来。
 // token 由 patch-app.mjs 通过 --token 注入（与 ~/.zcode/session-stats/daemon-token 一致），
 // 占位符 __ZC_STATS_TOKEN__ 在烘焙时被替换。
@@ -24,9 +29,28 @@ const CSS = `
   z-index: 2147483000;
   display: flex;
   align-items: center;
-  gap: 10px;
-  max-width: min(96vw, 720px);
-  padding: 5px 14px;
+  gap: 8px;
+  max-width: min(96vw, 760px);
+  font-size: 11.5px;
+  line-height: 16px;
+  letter-spacing: 0.01em;
+  font-variant-numeric: tabular-nums;
+  color: var(--color-foreground-subtle, #71717a);
+  white-space: nowrap;
+  user-select: none;
+  -webkit-user-select: none;
+  pointer-events: none; /* 容器透明不拦事件，pill 自行恢复 */
+}
+/* 给输入框下方留出悬浮条空间：输入框整体上移，下方留白由 pill 占用
+   （pill 高约 28px：留白 36px = 条体 28 + 上 2 + 下 6） */
+[data-testid="v4-composer"] {
+  margin-bottom: 36px !important;
+}
+[data-zcstats-bar] .zcstats-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 5px 12px;
   border-radius: 999px;
   background: var(--color-surface, #ffffff);
   background: color-mix(in srgb, var(--color-surface, #ffffff) 82%, transparent);
@@ -34,29 +58,27 @@ const CSS = `
   -webkit-backdrop-filter: blur(10px);
   border: 1px solid var(--color-border, #e4e4e7);
   box-shadow: 0 6px 24px rgba(0, 0, 0, 0.08);
-  font-size: 11.5px;
-  line-height: 16px;
-  letter-spacing: 0.01em;
-  font-variant-numeric: tabular-nums;
-  color: var(--color-foreground-subtle, #71717a);
-  white-space: nowrap;
-  overflow: hidden;
-  user-select: none;
-  -webkit-user-select: none;
   pointer-events: auto;
+  cursor: default;
+  min-width: 0;
 }
-/* 给输入框下方留出悬浮条空间：输入框整体上移，下方留白由悬浮条占用
-   （bar 高约 28px：留白 36px = 条体 28 + 上 2 + 下 6） */
-[data-testid="v4-composer"] {
-  margin-bottom: 36px !important;
+[data-zcstats-bar] .zcstats-pill[data-zcstats-clickable="1"] { cursor: pointer; }
+[data-zcstats-bar] .zcstats-pill[data-zcstats-clickable="1"]:hover {
+  border-color: var(--color-foreground-subtlest, #a1a1aa);
 }
-/* 窄窗口收缩：tokens 段允许省略 */
-[data-zcstats-bar] .zcstats-seg { display: inline-flex; align-items: baseline; gap: 4px; flex: 0 0 auto; }
-[data-zcstats-bar] .zcstats-seg[data-zcstats-seg="tokens"] { flex: 0 1 auto; min-width: 0; overflow: hidden; }
-[data-zcstats-bar] .zcstats-seg .zcstats-v { overflow: hidden; text-overflow: ellipsis; }
-[data-zcstats-bar] .zcstats-k { color: var(--color-foreground-subtlest, #a1a1aa); flex: none; }
-[data-zcstats-bar] .zcstats-v { color: var(--color-foreground-subtle, #71717a); }
-[data-zcstats-bar]:hover .zcstats-v { color: var(--color-foreground, #18181b); }
+[data-zcstats-bar] .zcstats-pill[data-zcstats-clickable="1"]:hover .zcstats-pill-text {
+  color: var(--color-foreground, #18181b);
+}
+[data-zcstats-bar] .zcstats-pill:focus-visible {
+  outline: 2px solid var(--color-accent, #3b82f6);
+  outline-offset: 1px;
+}
+[data-zcstats-bar] .zcstats-pill-icon {
+  display: inline-flex;
+  color: var(--color-foreground-subtlest, #a1a1aa);
+  flex: none;
+}
+[data-zcstats-bar] .zcstats-pill-text { overflow: hidden; text-overflow: ellipsis; }
 [data-zcstats-bar] .zcstats-dot {
   width: 7px; height: 7px; border-radius: 9999px;
   background: transparent;
@@ -73,27 +95,86 @@ const CSS = `
   background: var(--color-foreground-subtlest, #a1a1aa);
   animation: zcstats-pulse 1.2s ease-in-out infinite;
 }
-[data-zcstats-bar] .zcstats-sep { color: var(--color-border, #e4e4e7); flex: none; }
-[data-zcstats-bar].zcstats-wait .zcstats-sep { display: none; }
 @keyframes zcstats-pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.35; } }
-/* 触屏/悬停不影响展示 */
 @media (prefers-reduced-motion: reduce) {
   [data-zcstats-bar].zcstats-live .zcstats-dot,
   [data-zcstats-bar].zcstats-wait .zcstats-dot { animation: none; }
 }
+/* —— 统计弹层（对齐官方 stat-dialog 皮肤）—— */
+[data-zcstats-dialog] {
+  position: fixed;
+  z-index: 2147483001;
+  min-width: 250px;
+  max-width: min(92vw, 380px);
+  padding: 4px 0 6px;
+  border-radius: 12px;
+  background: var(--color-surface, #ffffff);
+  background: color-mix(in srgb, var(--color-surface, #ffffff) 97%, transparent);
+  backdrop-filter: blur(14px);
+  -webkit-backdrop-filter: blur(14px);
+  border: 1px solid var(--color-border, #e4e4e7);
+  box-shadow: 0 12px 36px rgba(0, 0, 0, 0.16);
+  font-size: 12px;
+  line-height: 18px;
+  color: var(--color-foreground, #18181b);
+  user-select: none;
+  -webkit-user-select: none;
+}
+[data-zcstats-dialog] .zcstats-dialog-head {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  margin: 0 14px;
+  padding: 6px 0 8px;
+  border-bottom: 1px solid var(--color-border, #e4e4e7);
+  font-weight: 500;
+}
+[data-zcstats-dialog] .zcstats-dialog-head .zcstats-pill-icon {
+  color: var(--color-foreground-subtle, #71717a);
+}
+[data-zcstats-dialog] .zcstats-dialog-sum {
+  margin-left: auto;
+  font-weight: 400;
+  color: var(--color-foreground-subtle, #71717a);
+  font-variant-numeric: tabular-nums;
+}
+[data-zcstats-dialog] .zcstats-dialog-rows { margin: 0; padding: 7px 14px 5px; }
+[data-zcstats-dialog] .zcstats-dialog-row {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 24px;
+  padding: 3.5px 0;
+}
+[data-zcstats-dialog] .zcstats-dialog-row dt {
+  margin: 0;
+  color: var(--color-foreground-subtle, #71717a);
+}
+[data-zcstats-dialog] .zcstats-dialog-row dd {
+  margin: 0;
+  color: var(--color-foreground, #18181b);
+  font-variant-numeric: tabular-nums;
+}
 `;
 
-const SEG_DEFS = [
-  { id: "turns" },
-  { id: "llm" },
-  { id: "speed" },
-  { id: "cache" },
-  { id: "tokens" },
-];
+// 内联 SVG 图标（currentColor 跟随主题；官方为 IconGaugeOutline16 / IconDatabaseOutline16）
+const ICON_GAUGE =
+  '<svg viewBox="0 0 16 16" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.3" aria-hidden="true">' +
+  '<path d="M2.7 10a5.5 5.5 0 1 1 10.6 0" stroke-linecap="round"/>' +
+  '<path d="M8 9.7 10.6 6.9" stroke-linecap="round"/>' +
+  '<circle cx="8" cy="9.9" r="1.1" fill="currentColor" stroke="none"/></svg>';
+const ICON_DB =
+  '<svg viewBox="0 0 16 16" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.3" aria-hidden="true">' +
+  '<ellipse cx="8" cy="3.8" rx="5.3" ry="2.1"/>' +
+  '<path d="M2.7 3.8v8.4c0 1.16 2.37 2.1 5.3 2.1s5.3-.94 5.3-2.1V3.8"/>' +
+  '<path d="M2.7 8c0 1.16 2.37 2.1 5.3 2.1s5.3-.94 5.3-2.1"/></svg>';
 
 let bar = null;
-let segs = {};
+let pills = {}; // { time, usage }
+let lastData = null;
+let lastViewKey;
 let failCount = 0;
+let dialog = null; // { root, kind, pill } —— 单槽位即互斥
 
 function fmtTokens(n) {
   if (n == null || isNaN(n)) return "—";
@@ -103,6 +184,11 @@ function fmtTokens(n) {
     return (k >= 100 ? Math.round(k) : k.toFixed(1)) + "K";
   }
   return (n / 1_000_000).toFixed(2) + "M";
+}
+
+function fmtExact(n) {
+  if (n == null || isNaN(n)) return "—";
+  return n.toLocaleString("en-US");
 }
 
 function fmtDur(ms) {
@@ -120,71 +206,123 @@ function fmtSec(ms) {
   return (ms / 1000).toFixed(ms < 9500 ? 1 : 0) + "s";
 }
 
+// ---------- 口径（对齐 DeepSeek Harness）----------
+
+// 有计时数字才可点开「会话统计」，否则 pill 是静态读数（官方规则：无数字弹层会空）
+function hasTiming(t) {
+  return !!(t && (t.llmMs > 0 || t.avgTtftMs != null));
+}
+// 有任何 token 数字才可点开「Token 用量」（官方规则：无 tokenUsage 不渲染用量区）
+function hasUsage(t) {
+  return !!(
+    t &&
+    ((t.inputTokens || 0) > 0 ||
+      (t.outputTokens || 0) > 0 ||
+      (t.cacheReadTokens || 0) > 0 ||
+      (t.cacheWriteTokens || 0) > 0)
+  );
+}
+// 计费总量 = 未缓存输入 + 缓存读 + 缓存写 + 输出
+// （本插件 inputTokens 为含缓存读的总输入，故不含 cacheRead；与官方口径一致）
+function billedTotal(t) {
+  return (t.inputTokens || 0) + (t.cacheWriteTokens || 0) + (t.outputTokens || 0);
+}
+// 缓存命中率展示：>99.5% 显示 100%（官方细则）；denom 与 daemon 口径一致
+function cacheHitDisplay(t) {
+  if (t.cacheHitPct == null) return null;
+  const denom = (t.inputTokens || 0) + (t.cacheWriteTokens || 0);
+  if (denom <= 0) return t.cacheHitPct;
+  const raw = ((t.cacheReadTokens || 0) / denom) * 100;
+  return raw >= 99.5 ? 100 : Math.round(raw);
+}
+
+// ---------- pill 构建 ----------
+
+function setPillClickable(el, clickable, label) {
+  if (clickable) {
+    el.setAttribute("data-zcstats-clickable", "1");
+    el.setAttribute("role", "button");
+    el.setAttribute("tabindex", "0");
+    el.setAttribute("aria-haspopup", "dialog");
+    if (!el.hasAttribute("aria-expanded")) el.setAttribute("aria-expanded", "false");
+  } else {
+    el.removeAttribute("data-zcstats-clickable");
+    el.removeAttribute("role");
+    el.removeAttribute("tabindex");
+    el.removeAttribute("aria-haspopup");
+    el.removeAttribute("aria-expanded");
+  }
+  if (label) el.setAttribute("aria-label", label);
+}
+
+function buildPill(kind, withDot, icon) {
+  const el = document.createElement("div");
+  el.className = "zcstats-pill";
+  el.setAttribute("data-zcstats-pill", kind);
+  if (withDot) {
+    const dot = document.createElement("span");
+    dot.className = "zcstats-dot";
+    dot.title = "会话统计";
+    el.appendChild(dot);
+  }
+  const iconSpan = document.createElement("span");
+  iconSpan.className = "zcstats-pill-icon";
+  iconSpan.innerHTML = icon;
+  const text = document.createElement("span");
+  text.className = "zcstats-pill-text";
+  el.append(iconSpan, text);
+  el.addEventListener("click", () => toggleDialog(kind));
+  el.addEventListener("keydown", (e) => {
+    if (el.getAttribute("data-zcstats-clickable") !== "1") return;
+    if (e.key === "Enter" || e.key === " ") {
+      e.preventDefault();
+      toggleDialog(kind);
+    }
+  });
+  return el;
+}
+
 function buildBar() {
   const el = document.createElement("div");
   el.setAttribute("data-zcstats-bar", "");
   el.style.display = "none";
-  const dot = document.createElement("span");
-  dot.className = "zcstats-dot";
-  dot.title = "会话统计";
-  el.appendChild(dot);
-  for (let i = 0; i < SEG_DEFS.length; i++) {
-    if (i > 0) {
-      const sep = document.createElement("span");
-      sep.className = "zcstats-sep";
-      sep.textContent = "│";
-      el.appendChild(sep);
-    }
-    const seg = document.createElement("span");
-    seg.className = "zcstats-seg";
-    seg.setAttribute("data-zcstats-seg", SEG_DEFS[i].id);
-    const k = document.createElement("span");
-    k.className = "zcstats-k";
-    const v = document.createElement("span");
-    v.className = "zcstats-v";
-    seg.append(k, v);
-    el.appendChild(seg);
-    segs[SEG_DEFS[i].id] = { seg, k, v };
-  }
+  pills = {
+    time: buildPill("time", true, ICON_GAUGE),
+    usage: buildPill("usage", false, ICON_DB),
+  };
+  el.append(pills.time, pills.usage);
   return el;
 }
 
-function setSeg(id, label, value, title) {
-  const s = segs[id];
-  if (!s) return;
-  s.seg.style.display = "";
-  if (s.k) s.k.textContent = label;
-  s.v.textContent = value;
-  if (title) s.seg.title = title;
-  else s.seg.removeAttribute("title");
-}
-
-function hideSeg(id) {
-  const s = segs[id];
-  if (s) s.seg.style.display = "none";
+function setPillText(kind, text) {
+  const t = pills[kind]?.querySelector(".zcstats-pill-text");
+  if (t) t.textContent = text;
 }
 
 function setWaitState() {
   if (!bar) return;
   bar.classList.add("zcstats-wait");
   bar.classList.remove("zcstats-live");
-  for (const seg of SEG_DEFS) hideSeg(seg.id);
-  // 把整条作为一个可读状态
-  setSeg("turns", "", "会话统计 · 等待本地服务…", "统计守护进程尚未就绪，正在自动重试");
+  pills.usage.style.display = "none";
+  setPillText("time", "会话统计 · 等待本地服务…");
+  setPillClickable(pills.time, false, "统计守护进程尚未就绪，正在自动重试");
+  closeDialog();
 }
 
 function render(data) {
   if (!bar) return;
+  lastData = data;
   bar.classList.remove("zcstats-wait");
   const t = data && data.available ? data.totals : null;
+  pills.usage.style.display = "";
   // daemon 可达但无数据（空会话/新会话）：显示全 0，绝不隐藏
   if (!t) {
     bar.classList.remove("zcstats-live");
-    setSeg("turns", "", "0 轮 · 0 步", "当前会话暂无统计数据");
-    setSeg("llm", "LLM", "—", "纯模型耗时");
-    setSeg("speed", "首 token", "—", "首 token / 输出吞吐");
-    setSeg("cache", "缓存", "—", "缓存命中");
-    setSeg("tokens", "", "输入 0 · 输出 0", "累计输入/输出 token");
+    setPillText("time", "0 轮 0 步");
+    setPillText("usage", "0 tok · 缓存命中 —");
+    setPillClickable(pills.time, false, "会话统计：当前会话暂无统计数据");
+    setPillClickable(pills.usage, false, "Token 用量：当前会话暂无统计数据");
+    syncOpenDialog();
     bar.style.display = "";
     return;
   }
@@ -192,16 +330,149 @@ function render(data) {
   if (data.live) {
     bar.querySelector(".zcstats-dot").title = `进行中 · 已 ${fmtDur(Date.now() - data.live.since)}`;
   }
-  setSeg("turns", "", `${t.turns} 轮 · ${t.steps} 步`,
-    `会话：${(data.session?.title || data.session?.id || "").slice(0, 80)}\n用户消息触发的轮：${t.turns}\n智能体步数（模型请求）：${t.steps}${t.retries ? `\n重试：${t.retries} 次` : ""}`);
-  setSeg("llm", "LLM", fmtDur(t.llmMs), `纯模型耗时 ${fmtDur(t.llmMs)}（${t.attempts} 次请求，不含工具执行）`);
-  setSeg("speed", "首 token", `${fmtSec(t.avgTtftMs)} · ${t.tokPerSec} tok/s`,
-    `首 token 中位 ${t.avgTtftMs != null ? (t.avgTtftMs / 1000).toFixed(2) + "s" : "—"}\n输出吞吐 ${t.tokPerSec} tok/s（总输出 / 生成时间）`);
-  setSeg("cache", "缓存", t.cacheHitPct != null ? t.cacheHitPct + "%" : "—",
-    `缓存命中 ${t.cacheHitPct != null ? t.cacheHitPct + "%" : "—"}\n命中 ${fmtTokens(t.cacheReadTokens)} tok / 输入 ${fmtTokens(t.inputTokens + (t.cacheWriteTokens || 0))} tok`);
-  setSeg("tokens", "", `输入 ${fmtTokens(t.inputTokens)} · 输出 ${fmtTokens(t.outputTokens)}`,
-    `累计输入 ${t.inputTokens?.toLocaleString()} tok（每步都会重发上下文，随轮数增长是正常的）\n累计输出 ${t.outputTokens?.toLocaleString()} tok`);
+
+  const timeClickable = hasTiming(t);
+  const tpsText = t.tokPerSec > 0 ? ` · ${t.tokPerSec} tok/s` : "";
+  setPillText("time", `${t.turns} 轮 ${t.steps} 步${tpsText}`);
+  setPillClickable(
+    pills.time,
+    timeClickable,
+    `会话统计：${t.turns} 轮 ${t.steps} 步${t.tokPerSec > 0 ? `，输出 ${t.tokPerSec} tok/s` : ""}，点击查看详情`
+  );
+
+  const p = cacheHitDisplay(t);
+  const usageClickable = hasUsage(t);
+  setPillText("usage", `${fmtTokens(billedTotal(t))} tok · 缓存命中 ${p != null ? p + "%" : "—"}`);
+  setPillClickable(
+    pills.usage,
+    usageClickable,
+    `Token 用量：共 ${fmtExact(billedTotal(t))} tok，缓存命中 ${p != null ? p + "%" : "—"}，点击查看详情`
+  );
+  syncOpenDialog();
   bar.style.display = "";
+}
+
+// ---------- 统计弹层（对齐官方 stat-dialog：portal / 锚定 / 外点关闭 / 互斥）----------
+
+const DIALOG_META = {
+  time: { title: "会话统计" },
+  usage: { title: "Token 用量" },
+};
+
+function dialogRows(rows) {
+  return (
+    `<dl class="zcstats-dialog-rows">` +
+    rows
+      .map(
+        ([k, v]) =>
+          `<div class="zcstats-dialog-row"><dt>${k}</dt><dd>${v}</dd></div>`
+      )
+      .join("") +
+    `</dl>`
+  );
+}
+
+function updateDialog() {
+  if (!dialog) return;
+  const t = lastData && lastData.available ? lastData.totals : null;
+  let head;
+  let rows;
+  if (dialog.kind === "time") {
+    head =
+      `<span class="zcstats-pill-icon">${ICON_GAUGE}</span><span>会话统计</span>`;
+    rows = [
+      ["模型用时", fmtDur(t?.llmMs)],
+      ["工具调用用时", t?.toolMs != null ? fmtDur(t.toolMs) : "—"],
+      ["首 token 平均（TTFT）", fmtSec(t?.avgTtftMs)],
+      ["输出速度（TPS）", t && t.tokPerSec > 0 ? `${t.tokPerSec} tok/s` : "—"],
+    ];
+  } else {
+    const total = t ? billedTotal(t) : null;
+    const p = t ? cacheHitDisplay(t) : null;
+    head =
+      `<span class="zcstats-pill-icon">${ICON_DB}</span><span>Token 用量</span>` +
+      (total != null
+        ? `<span class="zcstats-dialog-sum">${fmtExact(total)} tok</span>`
+        : "");
+    rows = [
+      ["缓存命中", p != null ? p + "%" : "—"],
+      ["未缓存输入", t ? `${fmtExact((t.inputTokens || 0) - (t.cacheReadTokens || 0))} tok` : "—"],
+      ["缓存读取", t ? `${fmtExact(t.cacheReadTokens || 0)} tok` : "—"],
+      ["输出", t ? `${fmtExact(t.outputTokens || 0)} tok` : "—"],
+    ];
+    // 官方细则：缓存写入为 0 时省略该行
+    if (t && (t.cacheWriteTokens || 0) !== 0) {
+      rows.push(["缓存写入", `${fmtExact(t.cacheWriteTokens)} tok`]);
+    }
+  }
+  dialog.root.innerHTML =
+    `<div class="zcstats-dialog-head">${head}</div>` + dialogRows(rows);
+}
+
+// 锚定 pill 上方 gap 8px，视口 12px 边距钳制；上方放不下时落下方
+function placeDialog() {
+  if (!dialog) return;
+  const r = dialog.pill.getBoundingClientRect();
+  const w = dialog.root.offsetWidth;
+  const h = dialog.root.offsetHeight;
+  if (!w || !h) return;
+  const M = 12;
+  const GAP = 8;
+  let top = r.top - h - GAP;
+  if (top < M) top = r.bottom + GAP;
+  if (top + h > window.innerHeight - M) top = Math.max(M, window.innerHeight - M - h);
+  let left = r.left + r.width / 2 - w / 2;
+  left = Math.min(Math.max(M, left), window.innerWidth - M - w);
+  dialog.root.style.left = Math.round(left) + "px";
+  dialog.root.style.top = Math.round(top) + "px";
+}
+
+function openDialog(kind) {
+  closeDialog();
+  const pill = pills[kind];
+  if (!pill || pill.getAttribute("data-zcstats-clickable") !== "1") return;
+  const root = document.createElement("div");
+  root.setAttribute("data-zcstats-dialog", "");
+  root.setAttribute("role", "dialog");
+  root.setAttribute("aria-label", DIALOG_META[kind].title);
+  root.style.visibility = "hidden"; // 先隐藏挂载测尺寸，再定位（两段式）
+  document.body.appendChild(root);
+  dialog = { root, kind, pill };
+  pill.setAttribute("aria-expanded", "true");
+  updateDialog();
+  placeDialog();
+  root.style.visibility = "visible";
+}
+
+function closeDialog() {
+  if (!dialog) return;
+  dialog.root.remove();
+  dialog.pill.removeAttribute("aria-expanded");
+  dialog = null;
+}
+
+function toggleDialog(kind) {
+  if (dialog && dialog.kind === kind) {
+    closeDialog();
+    return;
+  }
+  openDialog(kind);
+}
+
+// 数据/可点性变化后同步已打开的弹层：pill 失效则关，否则随轮询刷新
+function syncOpenDialog() {
+  if (!dialog) return;
+  const pill = pills[dialog.kind];
+  if (
+    !pill ||
+    pill.getAttribute("data-zcstats-clickable") !== "1" ||
+    pill.style.display === "none"
+  ) {
+    closeDialog();
+    return;
+  }
+  updateDialog();
+  placeDialog();
 }
 
 async function fetchStats(sessionId) {
@@ -220,9 +491,9 @@ async function fetchStats(sessionId) {
 }
 
 // ---------- 视图与会话探测 ----------
-// 悬浮条只在聊天对话视图显示：
+// 统计条只在聊天对话视图显示：
 //   - 更新弹窗是独立窗口但加载同一 index.html（windowKind=update-status）→ 不启动
-//   - 设置页是同窗覆盖层（聊天区被 inert 隐藏）→ 隐藏悬浮条
+//   - 设置页是同窗覆盖层（聊天区被 inert 隐藏）→ 隐藏统计条
 //   - 新建对话（draft）无会话 id → 清缓存、不带 session 查询（显示全 0）
 
 function looksLikeSessionId(v) {
@@ -266,7 +537,7 @@ function sessionIdFromFiber() {
 }
 
 // 返回 { visible, sessionId }
-//   visible=false → 不在聊天视图（设置/其他），悬浮条应隐藏
+//   visible=false → 不在聊天视图（设置/其他），统计条应隐藏
 //   sessionId      → sess_* 或 null（无会话/新建对话 → 不带 session 查询）
 function resolveViewState() {
   // 设置页开着，或聊天区被 inert 覆盖 → 不可见
@@ -292,7 +563,7 @@ function resolveViewState() {
   return { visible: true, sessionId: DRAFT_SENTINEL };
 }
 
-// 给输入框下方腾出悬浮条空间：内联样式优先级最高、必定生效。
+// 给输入框下方腾出统计条空间：内联样式优先级最高、必定生效。
 // React 重渲染可能清掉非受控内联属性，因此每次 tick 幂等补设。
 function ensureComposerSpace() {
   try {
@@ -303,11 +574,11 @@ function ensureComposerSpace() {
   } catch {}
 }
 
-// 动态定位：悬浮条放在聊天输入框**下方**的留白区内（输入框通过
+// 动态定位：统计条放在聊天输入框**下方**的留白区内（输入框通过
 // margin-bottom 腾出空间），水平方向与输入框对齐居中——互不遮挡。
-// 位置公式：bar 底边 = 留白高度 − bar 自身高度 − 2px 间隙，
-// 即 bar 顶边贴输入框底边下方 2px（diag 实测修正：此前 +2 方向反了且未减
-// bar 高度，导致 bar 整个叠回输入框内部）。
+// 位置公式：条底边 = 留白高度 − 条自身高度 − 2px 间隙，
+// 即条顶边贴输入框底边下方 2px（diag 实测修正：此前 +2 方向反了且未减
+// 条高度，导致整个叠回输入框内部）。
 function placeBar() {
   if (!bar) return;
   try {
@@ -344,9 +615,14 @@ async function tick() {
   const view = resolveViewState();
   if (!view.visible) {
     bar.style.display = "none"; // 设置页/非聊天视图 → 隐藏
+    closeDialog();
+    lastViewKey = undefined;
     return;
   }
-  ensureComposerSpace(); // 先保证输入框下方有留白，再定位悬浮条
+  // 会话切换 → 关闭弹层，避免上一会话的明细残留到下一帧刷新
+  if (lastViewKey !== undefined && lastViewKey !== view.sessionId) closeDialog();
+  lastViewKey = view.sessionId;
+  ensureComposerSpace(); // 先保证输入框下方有留白，再定位统计条
   placeBar();
 
   const data = await fetchStats(view.sessionId);
@@ -397,6 +673,7 @@ function reportDiag(view) {
             h: Math.round(b.height),
           }
         : null,
+      dialog: dialog ? dialog.kind : null,
       settingsOpen: !!document.querySelector('[data-testid="settings-page"]'),
       paneSessionId: pane ? pane.getAttribute("data-session-id") : null,
       view,
@@ -411,7 +688,7 @@ function reportDiag(view) {
 
 function start() {
   // 窗口级门控：更新弹窗是独立 BrowserWindow 但加载同一 index.html，
-  // 通过 windowKind=update-status 识别并直接不启动（该窗口不显示悬浮条）
+  // 通过 windowKind=update-status 识别并直接不启动（该窗口不显示统计条）
   try {
     if (new URLSearchParams(location.search).get("windowKind") === "update-status") return;
   } catch {}
@@ -425,9 +702,30 @@ function start() {
   setWaitState();
   bar.style.display = "";
 
+  // 弹层全局关闭：点击面板/触发器之外，或 Escape
+  document.addEventListener(
+    "pointerdown",
+    (e) => {
+      if (!dialog) return;
+      if (dialog.root.contains(e.target) || dialog.pill.contains(e.target)) return;
+      closeDialog();
+    },
+    true
+  );
+  document.addEventListener(
+    "keydown",
+    (e) => {
+      if (dialog && e.key === "Escape") closeDialog();
+    },
+    true
+  );
+
   setInterval(tick, POLL_MS);
   document.addEventListener("visibilitychange", tick);
-  window.addEventListener("resize", placeBar);
+  window.addEventListener("resize", () => {
+    placeBar();
+    placeDialog();
+  });
   tick();
 }
 

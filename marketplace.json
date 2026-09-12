@@ -19,7 +19,7 @@
         "en": "Session token & performance stats bar pinned to the ZCode window bottom, plus a /stats command that renders a detailed stats card in chat. NOTE: the status bar itself requires running install.sh once (asar injection is outside the marketplace mechanism); the marketplace install provides the hooks + /stats command.",
         "zh-CN": "固定在 ZCode 窗口底部的会话 token 与性能统计悬浮条，以及一个在对话中渲染详细统计卡片的 /stats 命令。注意：悬浮条本身需要先运行一次 install.sh（asar 注入不在 marketplace 机制内）；marketplace 安装提供 hooks 与 /stats 命令。"
       },
-      "version": "0.3.0",
+      "version": "0.4.0",
       "author": {
         "name": "w-PiaoPiao",
         "url": "https://github.com/w-PiaoPiao"

@@ -12,7 +12,8 @@
 //   轮   = COUNT(DISTINCT parent_user_message_id)  —— 用户消息触发的轮
 //   步   = COUNT(DISTINCT logical_request_id)      —— 智能体循环里的模型请求步数
 //   LLM  = SUM(duration_ms)                        —— 纯模型耗时（含重试，不含工具执行）
-//   首 token = 请求级 TTFT 中位数（抗重试长尾）
+//   工具 = SUM(duration_ms where completed)        —— 工具调用用时（并行调用按时长求和，与官方折算一致）
+//   首 token = 请求级 TTFT 均值（对齐 DeepSeek 官方「首 token 平均」口径）
 //   tok/s    = 总输出 / (总耗时 - 总 TTFT)
 //   缓存命中 = cache_read / (input + cache_write)  —— input 为含缓存读的总输入
 //
@@ -216,12 +217,6 @@ async function resolveSessionId(dbPath, pointerPath) {
   return resolved;
 }
 
-function median(sorted) {
-  const n = sorted.length;
-  if (!n) return null;
-  return n % 2 ? sorted[(n - 1) / 2] : Math.round((sorted[n / 2 - 1] + sorted[n / 2]) / 2);
-}
-
 // ---------- 统计聚合 ----------
 
 export async function computeSessionStats(opts = {}) {
@@ -265,19 +260,16 @@ export async function computeSessionStats(opts = {}) {
             SUM(CASE WHEN status='completed' AND time_to_first_token_ms IS NOT NULL THEN 1 ELSE 0 END) AS ttft_n,
             MAX(started_at) AS last_started_at
        FROM model_usage WHERE session_id='${SID}' AND query_source='main_turn'`,
-    // 2 TTFT 样本（算中位数用）
-    `SELECT time_to_first_token_ms AS v FROM model_usage
-      WHERE session_id='${SID}' AND query_source='main_turn' AND status='completed'
-        AND time_to_first_token_ms IS NOT NULL ORDER BY 1`,
-    // 3 最近一次请求（上下文占用 + 当前模型）
+    // 2 最近一次请求（上下文占用 + 当前模型）
     `SELECT model_id, input_tokens, output_tokens, duration_ms, time_to_first_token_ms, started_at, status
        FROM model_usage
       WHERE session_id='${SID}' AND query_source='main_turn' AND status='completed'
       ORDER BY started_at DESC LIMIT 1`,
-    // 4 工具调用聚合
-    `SELECT COUNT(*) AS tool_calls, COALESCE(SUM(status='error'),0) AS tool_errors
+    // 3 工具调用聚合（用时只统计已完成的调用）
+    `SELECT COUNT(*) AS tool_calls, COALESCE(SUM(status='error'),0) AS tool_errors,
+            COALESCE(SUM(CASE WHEN status='completed' THEN duration_ms END),0) AS tool_ms
        FROM tool_usage WHERE session_id='${SID}'`,
-    // 5 最近轮列表（按所属用户消息聚合；进行中的轮也展示）
+    // 4 最近轮列表（按所属用户消息聚合；进行中的轮也展示）
     `SELECT parent_user_message_id AS msg_id,
             MIN(turn_id) AS turn_id,
             MIN(started_at) AS started_at,
@@ -295,23 +287,20 @@ export async function computeSessionStats(opts = {}) {
       ORDER BY started_at DESC LIMIT 6`,
   ]);
 
-  const [sessRows, aggRows, ttftRows, lastRows, toolRows, turnRows] = docs;
+  const [sessRows, aggRows, lastRows, toolRows, turnRows] = docs;
   const sess = sessRows?.[0] || null;
   const a = aggRows?.[0] || {};
   const last = lastRows?.[0] || null;
   const tools = toolRows?.[0] || {};
-
-  const ttftValues = (ttftRows || []).map((r) => r.v).filter((v) => typeof v === "number");
-  const ttftMedian = median(ttftValues);
 
   const inputTokens = a.m_in ?? 0;
   const cacheRead = a.m_cread ?? 0;
   const cacheWrite = a.m_cwrite ?? 0;
   const outputTokens = a.m_out ?? 0;
   const llmMs = a.llm_ms ?? 0;
-  const reqTtftSum = a.ttft_sum ?? 0;
+  const avgTtftMs = a.ttft_n > 0 ? Math.round(a.ttft_sum / a.ttft_n) : null;
 
-  const genMs = Math.max(1, llmMs - reqTtftSum);
+  const genMs = Math.max(1, llmMs - (a.ttft_sum ?? 0));
   const tokPerSec = outputTokens > 0 ? Math.round((outputTokens * 1000) / genMs) : 0;
   const cacheDenom = inputTokens + cacheWrite;
   const cacheHitPct = cacheDenom > 0 ? Math.round((cacheRead / cacheDenom) * 100) : null;
@@ -344,8 +333,9 @@ export async function computeSessionStats(opts = {}) {
       retries: Math.max(0, (a.attempts ?? 0) - (a.steps ?? 0)),
       toolCalls: tools.tool_calls ?? 0,
       toolErrors: tools.tool_errors ?? 0,
+      toolMs: tools.tool_ms || null,
       llmMs,
-      avgTtftMs: ttftMedian,
+      avgTtftMs,
       tokPerSec,
       cacheHitPct,
       cacheReadTokens: cacheRead,

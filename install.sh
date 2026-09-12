@@ -117,8 +117,9 @@ fi
 
 cat <<'EOS'
 
-安装完成 ✔  重启 ZCode 后，窗口底部会出现会话统计悬浮条：
-    3 轮 · 12 步 │ LLM 45.2s │ 首 token 1.2s · 58 tok/s │ 缓存 98% │ 输入 118K · 输出 9.8K
+安装完成 ✔  重启 ZCode 后，输入框下方会出现两个统计 pill（点击开弹层）：
+    [仪表盘] 3 轮 12 步 · 58 tok/s      → 会话统计（模型/工具用时、TTFT、TPS）
+    [数据库] 128.1K tok · 缓存命中 98%  → Token 用量（精确分桶计数）
 
   /stats            在对话里让模型展示详细统计卡片
   手动验证          node ~/.zcode/session-stats/bin/cli.mjs
