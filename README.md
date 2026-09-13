@@ -2,30 +2,49 @@
 
 [English](#english) · [中文](#中文)
 
-A **session token & performance stats bar** for the ZCode desktop app, pinned to the
-bottom of the window. It shows real-time token usage and performance metrics of the
-current session — always visible, independent of the chat layout.
+Two **session stats pills** for the ZCode desktop app, pinned to the whitespace below
+the chat composer, showing real-time token usage and performance metrics of the
+current session. Click a pill to open a detail dialog. Always visible in chat views,
+independent of the chat layout.
 
-为 ZCode 桌面版打造的**会话 token 与性能统计悬浮条**，固定在窗口底部，实时显示
-当前会话的 token 用量与性能指标。**始终显示**，不依赖聊天区布局。
+为 ZCode 桌面版打造的**会话统计双胶囊**，固定在聊天输入框下方的留白区，实时显示
+当前会话的 token 用量与性能指标，点击胶囊弹出详情弹层。聊天视图内**始终显示**，
+不依赖聊天区布局。
 
 ```
-● 6 轮 · 159 步 │ LLM 1h 25m │ 首 token 7.2s · 29 tok/s │ 缓存 98% │ 输入 12.39M · 输出 84.0K
-● 6 turns · 159 steps │ LLM 1h 25m │ TTFT 7.2s · 29 tok/s │ cache 98% │ in 12.39M · out 84.0K
+● 6 turns · 12 steps · 42 tok/s      12.42M tok · cache hit 98%
+  gauge pill → "Session stats"        db pill → "Token usage" dialog
+
+● 6 轮 · 12 步 · 42 tok/s      12.42M tok · 缓存命中 98%
+  仪表盘 pill →「会话统计」弹层   数据库 pill →「Token 用量」弹层
 ```
 
 ## Features 功能
 
-- **Always-on floating bar** pinned to the window bottom — survives React re-renders,
-  session switches, and layout rebuilds.
-  **常驻底部悬浮条**——React 重渲染、切换会话、布局重建都不影响。
-- Shows turns/steps, LLM time, median TTFT, tok/s, cache hit %, cumulative in/out tokens.
-  展示轮/步、LLM 耗时、首 token 中位数、tok/s、缓存命中率、累计输入/输出 token。
-- Green breathing dot while a turn is running; gray while idle; pulsing gray while the
-  local daemon is warming up.
+- **Two pills below the composer**, aligned with the DeepSeek Harness official design:
+  a gauge pill (`N turns · M steps · X tok/s` + live dot) and a db pill
+  (`total tok · cache hit %`). Survives React re-renders, session switches, and layout
+  rebuilds.
+  **输入框下方双胶囊**，对齐 DeepSeek Harness 官方设计：仪表盘 pill（轮/步 + tok/s +
+  状态点）与数据库 pill（累计 token · 缓存命中）。React 重渲染、切换会话、布局重建
+  都不影响。
+- **Click a pill for a detail dialog** — "Session stats" (LLM time, tool time, avg
+  TTFT, output speed) and "Token usage" (cache hit, uncached input / cache read /
+  cache write / output, all exact token counts). Anchored above the pill, closes on
+  outside click / Escape, the two dialogs are mutually exclusive, and content
+  refreshes with the 1s polling while open.
+  **点击胶囊弹出详情**——「会话统计」（LLM 用时、工具用时、首 token 平均、输出速度）
+  与「Token 用量」（缓存命中、未缓存输入/缓存读取/缓存写入/输出，均为精确 token 数）。
+  弹层锚定在胶囊上方，点击外部 / Escape 关闭，两个弹层互斥，打开期间随每秒轮询刷新。
+- Green breathing dot on the gauge pill while a turn is running; gray while idle;
+  pulsing gray while the local daemon is warming up.
   轮次进行中圆点绿色呼吸，空闲灰色，本地服务未就绪时灰色脉动。
-- Hover any metric for exact values & definitions. 悬停查看精确值与口径。
-- Follows the ZCode light/dark theme; shrinks gracefully on narrow windows.
+- View-gated: shows only in chat conversation views (hidden on the settings page and
+  in the update window); a new/draft chat shows all zeros instead of the previous
+  session's data.
+  视图门控：仅在聊天对话视图显示（设置页、更新弹窗中隐藏）；新建对话显示全 0，
+  不残留上一个会话的数据。
+- Follows the ZCode light/dark theme; pills shrink gracefully on narrow windows.
   跟随明暗主题；窄窗口自动收缩。
 - `/stats` slash command renders a detailed stats card in chat.
   `/stats` 斜杠命令在对话中渲染详细统计卡片。
@@ -50,9 +69,9 @@ command.
 
 > ⚠️ The **status bar itself is NOT installable via the marketplace**: it needs to
 > patch `ZCode.app` resources (asar injection), which the plugin-marketplace mechanism
-> cannot do. To get the floating bar, run Option B once on the machine.
+> cannot do. To get the pills, run Option B once on the machine.
 
-#### Option B — Full install (with the floating bar)
+#### Option B — Full install (with the stats pills)
 
 Requires **ZCode desktop** + **Node.js ≥ 22.13** (node:sqlite built-in).
 
@@ -64,8 +83,9 @@ bash install.sh
 
 Then **restart ZCode** (Cmd+Q / quit & reopen). The script:
 
-1. Installs the runtime to `~/.zcode/session-stats/` and generates a local access
-   token (`daemon-token`, 0600) shared by daemon / bar / CLI.
+1. Installs the runtime to `~/.zcode/session-stats/` and generates (or reuses) a
+   local access token (`daemon-token`, 0600) shared by daemon / pills / CLI. Reusing
+   keeps the token baked into an already-patched asar valid across reinstalls.
 2. Registers hooks (`SessionStart` / `UserPromptSubmit` / `Stop`) and the `/stats`
    command in `~/.zcode/cli/config.json` + `~/.zcode/commands/stats.md`.
 3. Checks the asar integrity fuse, then injects the status bar into ZCode's
@@ -99,7 +119,7 @@ Then **restart ZCode** (Cmd+Q / quit & reopen). The script:
 #### Uninstall / Doctor
 
 ```bash
-bash uninstall.sh   # restores app.asar, removes hooks/command, stops daemon
+bash uninstall.sh   # restores app.asar, removes hooks/command, clears the NODE_OPTIONS entry, stops daemon
 bash doctor.sh      # one-shot health check (patch, fuse, daemon, data link, CLI)
 ```
 
@@ -114,9 +134,11 @@ Node's built-in `node:sqlite` (no external sqlite3 needed on any platform).
 | Turns | Distinct `parent_user_message_id` (user-message turns) |
 | Steps | Distinct `logical_request_id` (model requests in the agent loop) |
 | LLM time | Sum of `duration_ms` of completed requests (incl. retries, excl. tool time) |
-| TTFT | **Median** request-level TTFT (robust against retry tails) |
+| Tool time | Sum of `duration_ms` of completed tool calls (parallel calls summed) |
+| TTFT | **Average** request-level TTFT (aligned with DeepSeek's "first token avg") |
 | tok/s | Total output ÷ (total duration − total TTFT) |
-| Cache | `cache_read / (input + cache_write)` |
+| Cache | `cache_read / (input + cache_write)`; displayed as 100% when ≥ 99.5% |
+| Total | Uncached input + cache write + output (the db pill value; `inputTokens` already includes cache read) |
 | In / Out | Cumulative tokens (input grows with turns — context is resent every step) |
 
 #### Architecture
@@ -124,12 +146,17 @@ Node's built-in `node:sqlite` (no external sqlite3 needed on any platform).
 ```
 hooks(on-event.mjs)─write session pointer─┐
                                           ▼
-ZCode DB ◄─read-only─ daemon.mjs ──HTTP 127.0.0.1:47771──► floating bar (injected renderer)
+ZCode DB ◄─read-only─ daemon.mjs ──HTTP 127.0.0.1:47771──► pills + dialogs (injected renderer)
                                           ▲                              │ polls every 1s
 /stats command ─► bin/cli.mjs ───────────┘ (falls back to direct DB)    │ ?session=<active>
                                                                          ▼
-                                               fixed bottom bar (best-effort taskId probe)
+                                    gauge pill (turns/steps · tok/s · live dot)
+                                    db pill (total tok · cache hit) → detail dialogs
+                                    (session id: DOM data-session-id, fiber taskId fallback)
 ```
+
+The pills also POST their view/positioning diagnostics to the daemon every 15s
+(written to `daemon.log`, for troubleshooting only).
 
 #### Known limitations
 
@@ -138,8 +165,11 @@ ZCode DB ◄─read-only─ daemon.mjs ──HTTP 127.0.0.1:47771──► float
 - The patch invalidates the app's code signature; quarantine is auto-removed. If the
   system still reports "damaged", run:
   `sudo xattr -rd com.apple.quarantine /Applications/ZCode.app` (macOS only).
-- Right after ZCode launches, before the daemon is up, the bar shows
-  "waiting for local stats service…" and switches to real metrics automatically.
+- Right after ZCode launches, before the daemon is up, the gauge pill shows
+  "session stats · waiting for local service…" and switches to real metrics
+  automatically.
+- For troubleshooting: the pills POST their view/positioning state to the daemon
+  every 15s; check `~/.zcode/session-stats/daemon.log`.
 
 ---
 
@@ -157,11 +187,11 @@ ZCode DB ◄─read-only─ daemon.mjs ──HTTP 127.0.0.1:47771──► float
 
 安装后获得 hooks（会话指针 + daemon 自动拉起）与 `/stats` 命令。
 
-> ⚠️ **悬浮条本身无法通过 marketplace 安装**：它需要修改 `ZCode.app` 资源
-> （asar 注入），而插件市场机制只能分发 manifest 声明的组件。要显示悬浮条，
+> ⚠️ **统计胶囊本身无法通过 marketplace 安装**：它需要修改 `ZCode.app` 资源
+> （asar 注入），而插件市场机制只能分发 manifest 声明的组件。要显示胶囊，
 > 请在本机执行一次方式 B。
 
-#### 方式 B — 完整安装（含底部悬浮条）
+#### 方式 B — 完整安装（含统计胶囊）
 
 前置：**ZCode 桌面版** + **Node.js ≥ 22.13**（自带 node:sqlite）。
 
@@ -174,7 +204,8 @@ bash install.sh
 然后**重启 ZCode**。脚本会：
 
 1. 把运行时装到 `~/.zcode/session-stats/`（排除日志），生成本地访问 token
-   `daemon-token`（0600，daemon / 悬浮条 / CLI 三方共享）
+   `daemon-token`（0600，daemon / 胶囊 / CLI 三方共享；已有则复用，
+   避免已打补丁 asar 内烘焙的旧 token 失效）
 2. 在 `~/.zcode/cli/config.json` 注册 hooks（SessionStart / UserPromptSubmit / Stop）
    与 `/stats` 命令（`~/.zcode/commands/stats.md`）
 3. 先检查 asar 完整性 fuse，再把状态栏注入 ZCode 的 `app.asar`
@@ -204,7 +235,7 @@ bash install.sh
 #### 卸载 / 自检
 
 ```bash
-bash uninstall.sh   # 还原 app.asar、移除 hooks/命令、停 daemon
+bash uninstall.sh   # 还原 app.asar、移除 hooks/命令、清理 NODE_OPTIONS 注入项、停 daemon
 bash doctor.sh      # 一键自检（补丁/fuse/daemon/数据链路/CLI）
 ```
 
@@ -219,9 +250,11 @@ ZCode 桌面版本来就把每次模型请求写进本地数据库
 | 轮 | 不同 `parent_user_message_id` 数（用户消息触发的轮） |
 | 步 | 不同 `logical_request_id` 数（智能体循环中的模型请求） |
 | LLM | 已完成请求的 `duration_ms` 总和（含重试，不含工具执行） |
-| 首 token | 请求级 TTFT 的**中位数**（抗重试长尾干扰） |
+| 工具 | 已完成工具调用的 `duration_ms` 总和（并行调用按时长求和） |
+| 首 token | 请求级 TTFT 的**平均值**（对齐 DeepSeek 官方「首 token 平均」口径） |
 | tok/s | 总输出 ÷（总耗时 − 总 TTFT） |
-| 缓存 | `cache_read / (input + cache_write)` |
+| 缓存 | `cache_read / (input + cache_write)`；≥ 99.5% 时显示为 100% |
+| 总量 | 未缓存输入 + 缓存写 + 输出（数据库 pill 展示值；`inputTokens` 本身已含缓存读） |
 | 输入/输出 | 累计 token（输入随轮数增长是正常的——每步都重发上下文） |
 
 #### 架构
@@ -229,12 +262,16 @@ ZCode 桌面版本来就把每次模型请求写进本地数据库
 ```
 hooks(on-event.mjs)──写会话指针──┐
                                  ▼
-ZCode 数据库 ◄──只读── daemon.mjs ──HTTP 127.0.0.1:47771──► 悬浮条(注入渲染器)
+ZCode 数据库 ◄──只读── daemon.mjs ──HTTP 127.0.0.1:47771──► 双胶囊 + 弹层(注入渲染器)
                                  ▲                          │ 每秒轮询
 /stats 命令 ──► bin/cli.mjs ─────┘（daemon 不在时直查库）   │ ?session=<当前会话>
                                                             ▼
-                                    固定底部悬浮条（尽力探测 taskId，失败回退最近活跃）
+                              仪表盘 pill（轮/步 · tok/s · 状态点）
+                              数据库 pill（总量 · 缓存命中）→ 点击弹详情弹层
+                    （会话 id：DOM data-session-id 优先，React fiber taskId 兜底）
 ```
+
+渲染端每 15s 把视图/定位诊断 POST 给 daemon，写入 `daemon.log`（仅排障用）。
 
 #### 已知限制
 
@@ -243,8 +280,10 @@ ZCode 数据库 ◄──只读── daemon.mjs ──HTTP 127.0.0.1:47771─�
 - 补丁使 app 的资源签名封条失效（本地修改的代价）。已自动移除 quarantine；
   若系统仍弹"已损坏"，执行：
   `sudo xattr -rd com.apple.quarantine /Applications/ZCode.app`（仅 macOS）
-- ZCode 刚启动、守护进程尚未就绪时，悬浮条显示「等待本地服务…」，
+- ZCode 刚启动、守护进程尚未就绪时，仪表盘 pill 显示「会话统计 · 等待本地服务…」，
   就绪后自动切到真实指标。
+- 排障：渲染端每 15s 把视图/定位内部状态上报给 daemon，写在
+  `~/.zcode/session-stats/daemon.log`。
 
 ---
 
@@ -262,8 +301,11 @@ plugins/session-stats/        Plugin package (components installed by the market
   bin/configure.mjs           Hooks/command registrar
   commands/stats.md           /stats command definition
 app-patch/
-  session-stats-bar.js        Floating bar UI (injected renderer, vanilla JS)
+  session-stats-bar.js        Pill bar UI + detail dialogs (injected renderer, vanilla JS)
   patch-app.mjs               asar patch/restore/status (fuse check, backup metadata)
+  inject-main.cjs             Main-process injector for the NODE_OPTIONS no-patch route (reserved)
+  probe-fuse.mjs              Electron fuse reader (no-patch route feasibility)
+  set-node-options.mjs        User-level NODE_OPTIONS read/merge/remove (Windows)
 lib/
   zcenv.sh                    Cross-platform env detection + daemon lifecycle
 install.sh / uninstall.sh     One-shot install / uninstall (cross-platform)
@@ -271,8 +313,10 @@ doctor.sh                     One-shot health check
 ```
 
 Runtime artifacts (created by `install.sh` in `~/.zcode/session-stats/`):
-`daemon-token` (0600), `current-session.json` (session pointer), `daemon.log`,
-`daemon.pid`, `zcode.pid`.
+`daemon-token` (0600), `current-session.json` (session pointer), `daemon.log`
+(daemon log + renderer diagnostics), `daemon.pid`, `zcode.pid`, `.inject-mode`
+(renderer injection route: `patch` / `no-patch`), `.installed-asar` (patched asar
+path, used by uninstall to restore).
 
 ## License
 
