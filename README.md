@@ -2,40 +2,46 @@
 
 [English](#english) · [中文](#中文)
 
-Two **session stats pills** for the ZCode desktop app, pinned to the whitespace below
-the chat composer, showing real-time token usage and performance metrics of the
-current session. Click a pill to open a detail dialog. Always visible in chat views,
-independent of the chat layout.
+Two **session stats pills plus a context ring** for the ZCode desktop app, pinned to
+the whitespace below the chat composer, showing real-time token usage, performance
+metrics and context occupancy of the current session. Click any of the three to open a
+detail dialog (the ring is hidden when the model's context window is unknown). Always
+visible in chat views, independent of the chat layout.
 
-为 ZCode 桌面版打造的**会话统计双胶囊**，固定在聊天输入框下方的留白区，实时显示
-当前会话的 token 用量与性能指标，点击胶囊弹出详情弹层。聊天视图内**始终显示**，
-不依赖聊天区布局。
+为 ZCode 桌面版打造的**会话统计双胶囊 + 上下文圆环**，固定在聊天输入框下方的留白区，
+实时显示当前会话的 token 用量、性能指标与上下文占用，点击任意一项弹出详情弹层
+（模型上下文窗口未知时不显示圆环）。聊天视图内**始终显示**，不依赖聊天区布局。
 
 ```
-● 6 turns · 12 steps · 42 tok/s      12.42M tok · cache hit 98%
-  gauge pill → "Session stats"        db pill → "Token usage" dialog
+● 6 turns · 12 steps · 42 tok/s      12.42M tok · cache hit 98%      ◔ 15%
+  gauge pill → "Session stats"       db pill → "Token usage" dialog  ring → "Context"
 
-● 6 轮 · 12 步 · 42 tok/s      12.42M tok · 缓存命中 98%
-  仪表盘 pill →「会话统计」弹层   数据库 pill →「Token 用量」弹层
+● 6 轮 · 12 步 · 42 tok/s      12.42M tok · 缓存命中 98%      ◔ 15%
+  仪表盘 pill →「会话统计」弹层   数据库 pill →「Token 用量」弹层   圆环 →「上下文容量」弹层
 ```
 
 ## Features 功能
 
-- **Two pills below the composer**, aligned with the DeepSeek Harness official design:
-  a gauge pill (`N turns · M steps · X tok/s` + live dot) and a db pill
-  (`total tok · cache hit %`). Survives React re-renders, session switches, and layout
-  rebuilds.
-  **输入框下方双胶囊**，对齐 DeepSeek Harness 官方设计：仪表盘 pill（轮/步 + tok/s +
-  状态点）与数据库 pill（累计 token · 缓存命中）。React 重渲染、切换会话、布局重建
-  都不影响。
-- **Click a pill for a detail dialog** — "Session stats" (LLM time, tool time, avg
-  TTFT, output speed) and "Token usage" (cache hit, uncached input / cache read /
-  cache write / output, all exact token counts). Anchored above the pill, closes on
-  outside click / Escape, the two dialogs are mutually exclusive, and content
-  refreshes with the 1s polling while open.
-  **点击胶囊弹出详情**——「会话统计」（LLM 用时、工具用时、首 token 平均、输出速度）
-  与「Token 用量」（缓存命中、未缓存输入/缓存读取/缓存写入/输出，均为精确 token 数）。
-  弹层锚定在胶囊上方，点击外部 / Escape 关闭，两个弹层互斥，打开期间随每秒轮询刷新。
+- **Two pills plus a context ring below the composer**, aligned with the DeepSeek
+  Harness official design (including the 2026-09-17 change that moved the context
+  meter into the composer stats row): a gauge pill (`N turns · M steps · X tok/s` +
+  live dot), a db pill (`total tok · cache hit %`), and a context ring
+  (`◔ percentage used`, after the two pills). Survives React re-renders, session
+  switches, and layout rebuilds.
+  **输入框下方双胶囊 + 上下文圆环**，对齐 DeepSeek Harness 官方设计（含 2026-09-17
+  官方把上下文计量并入统计行的变更）：仪表盘 pill（轮/步 + tok/s + 状态点）、
+  数据库 pill（累计 token · 缓存命中）与上下文圆环（`◔ 已用百分比`，位于两个 pill
+  之后）。React 重渲染、切换会话、布局重建都不影响。
+- **Click an item for a detail dialog** — "Session stats" (LLM time, tool time, avg
+  TTFT, output speed), "Token usage" (cache hit, uncached input / cache read /
+  cache write / output, all exact token counts) and "Context" (used / window with a
+  usage bar). Anchored above the trigger, closes on outside click / Escape, the
+  dialogs are mutually exclusive, and content refreshes with the 1s polling while
+  open.
+  **点击任一项弹出详情**——「会话统计」（LLM 用时、工具用时、首 token 平均、输出速度）、
+  「Token 用量」（缓存命中、未缓存输入/缓存读取/缓存写入/输出，均为精确 token 数）
+  与「上下文容量」（已用 / 窗口 + 占用条）。弹层锚定在触发器上方，点击外部 / Escape
+  关闭，三个弹层互斥，打开期间随每秒轮询刷新。
 - Green breathing dot on the gauge pill while a turn is running; gray while idle;
   pulsing gray while the local daemon is warming up.
   轮次进行中圆点绿色呼吸，空闲灰色，本地服务未就绪时灰色脉动。
@@ -127,7 +133,10 @@ bash doctor.sh      # one-shot health check (patch, fuse, daemon, data link, CLI
 
 ZCode desktop already records every model request into
 `~/.zcode/cli/db/db.sqlite`. This plugin only does **read-only** aggregation via
-Node's built-in `node:sqlite` (no external sqlite3 needed on any platform).
+Node's built-in `node:sqlite` (no external sqlite3 needed on any platform). The
+context window is read (also read-only) from ZCode's own model config:
+`~/.zcode/v2/provider_config.json`, falling back to the bundled model table under
+`~/.zcode/v2/runtime/provider/`.
 
 | Metric | Definition |
 |---|---|
@@ -139,6 +148,7 @@ Node's built-in `node:sqlite` (no external sqlite3 needed on any platform).
 | tok/s | Total output ÷ (total duration − total TTFT) |
 | Cache | `cache_read / (input + cache_write)`; displayed as 100% when ≥ 99.5% |
 | Total | Uncached input + cache write + output (the db pill value; `inputTokens` already includes cache read) |
+| Context | Used = the last completed main-turn request's `input_tokens` (incl. cache read); window = the model's `contextWindow`; the ring shows the rounded percentage |
 | In / Out | Cumulative tokens (input grows with turns — context is resent every step) |
 
 #### Architecture
@@ -146,13 +156,16 @@ Node's built-in `node:sqlite` (no external sqlite3 needed on any platform).
 ```
 hooks(on-event.mjs)─write session pointer─┐
                                           ▼
-ZCode DB ◄─read-only─ daemon.mjs ──HTTP 127.0.0.1:47771──► pills + dialogs (injected renderer)
-                                          ▲                              │ polls every 1s
-/stats command ─► bin/cli.mjs ───────────┘ (falls back to direct DB)    │ ?session=<active>
-                                                                         ▼
-                                    gauge pill (turns/steps · tok/s · live dot)
-                                    db pill (total tok · cache hit) → detail dialogs
-                                    (session id: DOM data-session-id, fiber taskId fallback)
+ZCode DB ◄─read-only─┐
+ZCode model config ◄─┴─ daemon.mjs ──HTTP 127.0.0.1:47771──► pills + ring + dialogs
+(provider_config.json)      ▲                                    (injected renderer)
+                            │                                         │ polls every 1s
+/stats command ─► bin/cli.mjs┘ (direct DB fallback)                   │ ?session=<active>
+                                                                      ▼
+                                        gauge pill (turns/steps · tok/s · live dot)
+                                        db pill (total tok · cache hit)
+                                        context ring (◔ used %) → detail dialogs
+                                        (session id: DOM data-session-id, fiber taskId fallback)
 ```
 
 The pills also POST their view/positioning diagnostics to the daemon every 15s
@@ -243,7 +256,9 @@ bash doctor.sh      # 一键自检（补丁/fuse/daemon/数据链路/CLI）
 
 ZCode 桌面版本来就把每次模型请求写进本地数据库
 `~/.zcode/cli/db/db.sqlite`。本插件只做**只读**聚合，统一走 Node 内置
-`node:sqlite`（任何平台都无需外部 sqlite3）。
+`node:sqlite`（任何平台都无需外部 sqlite3）。上下文窗口也以只读方式取 ZCode
+自己的模型配置：`~/.zcode/v2/provider_config.json`（用户/服务端下发的模型设置），
+找不到时退回内置模型表 `~/.zcode/v2/runtime/provider/`。
 
 | 指标 | 口径 |
 |---|---|
@@ -255,6 +270,7 @@ ZCode 桌面版本来就把每次模型请求写进本地数据库
 | tok/s | 总输出 ÷（总耗时 − 总 TTFT） |
 | 缓存 | `cache_read / (input + cache_write)`；≥ 99.5% 时显示为 100% |
 | 总量 | 未缓存输入 + 缓存写 + 输出（数据库 pill 展示值；`inputTokens` 本身已含缓存读） |
+| 上下文 | 已用 = 最近一次已完成主轮请求的 `input_tokens`（含缓存读）；窗口 = 该模型的 `contextWindow`；圆环显示四舍五入后的百分比 |
 | 输入/输出 | 累计 token（输入随轮数增长是正常的——每步都重发上下文） |
 
 #### 架构
@@ -262,16 +278,19 @@ ZCode 桌面版本来就把每次模型请求写进本地数据库
 ```
 hooks(on-event.mjs)──写会话指针──┐
                                  ▼
-ZCode 数据库 ◄──只读── daemon.mjs ──HTTP 127.0.0.1:47771──► 双胶囊 + 弹层(注入渲染器)
-                                 ▲                          │ 每秒轮询
-/stats 命令 ──► bin/cli.mjs ─────┘（daemon 不在时直查库）   │ ?session=<当前会话>
-                                                            ▼
-                              仪表盘 pill（轮/步 · tok/s · 状态点）
-                              数据库 pill（总量 · 缓存命中）→ 点击弹详情弹层
-                    （会话 id：DOM data-session-id 优先，React fiber taskId 兜底）
+ZCode 数据库 ◄──只读──┐
+ZCode 模型配置 ◄──只读─┴─ daemon.mjs ──HTTP 127.0.0.1:47771──► 双胶囊 + 圆环 + 弹层
+(provider_config.json)         ▲                                   (注入渲染器)
+                               │                                        │ 每秒轮询
+/stats 命令 ──► bin/cli.mjs ───┘（daemon 不在时直查库）                 │ ?session=<当前会话>
+                                                                        ▼
+                                    仪表盘 pill（轮/步 · tok/s · 状态点）
+                                    数据库 pill（总量 · 缓存命中）
+                                    上下文圆环（◔ 已用 %）→ 点击弹详情弹层
+                          （会话 id：DOM data-session-id 优先，React fiber taskId 兜底）
 ```
 
-渲染端每 15s 把视图/定位诊断 POST 给 daemon，写入 `daemon.log`（仅排障用）。
+渲染端每 15s 把视图/定位/圆环诊断 POST 给 daemon，写入 `daemon.log`（仅排障用）。
 
 #### 已知限制
 
@@ -282,8 +301,12 @@ ZCode 数据库 ◄──只读── daemon.mjs ──HTTP 127.0.0.1:47771─�
   `sudo xattr -rd com.apple.quarantine /Applications/ZCode.app`（仅 macOS）
 - ZCode 刚启动、守护进程尚未就绪时，仪表盘 pill 显示「会话统计 · 等待本地服务…」，
   就绪后自动切到真实指标。
+- 模型上下文窗口取不到（配置里既无该模型、内置表也匹配不到）时，**圆环整项隐藏**，
+  两个 pill 照常显示——与官方 `contextOccupancy` 在无容量数据时不渲染一致。
+- 上下文弹层只画总量占用条：ZCode 数据库里没有「系统提示 / 工具 / 对话」的来源
+  拆分，走官方在 `contextBreakdown` 缺席时的单色段降级路径。
 - 排障：渲染端每 15s 把视图/定位内部状态上报给 daemon，写在
-  `~/.zcode/session-stats/daemon.log`。
+  `~/.zcode/session-stats/daemon.log`（含圆环的 shown/percent/used/window）。
 
 ---
 

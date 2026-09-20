@@ -16,6 +16,8 @@
 //   首 token = 请求级 TTFT 均值（对齐 DeepSeek 官方「首 token 平均」口径）
 //   tok/s    = 总输出 / (总耗时 - 总 TTFT)
 //   缓存命中 = cache_read / (input + cache_write)  —— input 为含缓存读的总输入
+//   上下文   = 最近一次已完成主轮请求的 input_tokens（含缓存读）÷ 模型上下文窗口
+//              （窗口来自 ZCode 的模型配置，见 resolveContextWindow）
 //
 // 所有查询走 node:sqlite（Node 22.5+ 内置），以只读模式打开，不影响运行中的 ZCode。
 // 跨平台：macOS/Linux/Windows 均无需外部 sqlite3（Windows 无系统 sqlite3，
@@ -217,6 +219,138 @@ async function resolveSessionId(dbPath, pointerPath) {
   return resolved;
 }
 
+// ---------- 模型上下文窗口 ----------
+//
+// 上下文占用（对齐 DeepSeek Harness 的 contextPressure 口径）需要「已用 ÷ 窗口」，
+// 窗口值 ZCode 自己存在两处可按 modelId 查到（都是本机文件，无需外部依赖）：
+//   1. ~/.zcode/v2/provider_config.json 的 modelConfigRules.providerModelRules
+//      —— 用户/服务端下发的模型设置，providerId + modelId 精确匹配
+//   2. ~/.zcode/v2/runtime/provider/<平台-架构>/<版本>/endpoint-*/zcode-builtin.json
+//      的 modelConfigRules.modelRules —— 内置模型默认表，按 modelMatch 正则匹配
+//      （后写覆盖先写，与 ZCode 配置合并惯例一致），取版本号最大的 runtime 目录
+// 两处都查不到窗口值时不上报上下文占用（渲染端据此隐藏圆环，与官方
+// contextOccupancy 在无容量时不渲染的行为一致）。
+
+const PROVIDER_CONFIG_PATH = path.join(os.homedir(), ".zcode/v2/provider_config.json");
+const RUNTIME_PROVIDER_DIR = path.join(os.homedir(), ".zcode/v2/runtime/provider");
+
+const jsonCache = new Map(); // path -> { mtimeMs, size, json }
+
+function readJsonCached(p) {
+  try {
+    const st = fs.statSync(p);
+    const hit = jsonCache.get(p);
+    if (hit && hit.mtimeMs === st.mtimeMs && hit.size === st.size) return hit.json;
+    const json = JSON.parse(fs.readFileSync(p, "utf8"));
+    jsonCache.set(p, { mtimeMs: st.mtimeMs, size: st.size, json });
+    return json;
+  } catch {
+    return null;
+  }
+}
+
+function cmpVersion(a, b) {
+  const pa = String(a).split(/[.\-+]/);
+  const pb = String(b).split(/[.\-+]/);
+  for (let i = 0; i < Math.max(pa.length, pb.length); i++) {
+    const na = Number(pa[i]);
+    const nb = Number(pb[i]);
+    if (Number.isNaN(na) || Number.isNaN(nb)) {
+      const d = String(pa[i] ?? "").localeCompare(String(pb[i] ?? ""));
+      if (d !== 0) return d;
+      continue;
+    }
+    if (na !== nb) return na - nb;
+  }
+  return 0;
+}
+
+let builtinScan = { at: 0, file: null };
+
+// 版本目录会随 ZCode 升级累积，取版本号最大且含 endpoint-*/zcode-builtin.json 的那个
+function builtinConfigFile() {
+  const now = Date.now();
+  if (builtinScan.file !== null && now - builtinScan.at < 30000) return builtinScan.file;
+  let best = null;
+  let bestVer = null;
+  try {
+    for (const plat of fs.readdirSync(RUNTIME_PROVIDER_DIR, { withFileTypes: true })) {
+      if (!plat.isDirectory()) continue;
+      const platDir = path.join(RUNTIME_PROVIDER_DIR, plat.name);
+      let versions = [];
+      try {
+        versions = fs.readdirSync(platDir, { withFileTypes: true });
+      } catch {
+        continue;
+      }
+      for (const ver of versions) {
+        if (!ver.isDirectory()) continue;
+        if (bestVer !== null && cmpVersion(ver.name, bestVer) <= 0) continue;
+        const verDir = path.join(platDir, ver.name);
+        let eps = [];
+        try {
+          eps = fs.readdirSync(verDir);
+        } catch {
+          continue;
+        }
+        const ep = eps.find((n) => n.startsWith("endpoint-"));
+        if (!ep) continue;
+        const f = path.join(verDir, ep, "zcode-builtin.json");
+        if (!fs.existsSync(f)) continue;
+        best = f;
+        bestVer = ver.name;
+      }
+    }
+  } catch {}
+  builtinScan = { at: now, file: best };
+  return best;
+}
+
+function contextWindowFromProviderConfig(modelId, providerId) {
+  const rules = readJsonCached(PROVIDER_CONFIG_PATH)?.config?.modelConfigRules?.providerModelRules;
+  if (!Array.isArray(rules)) return null;
+  const pick = (r) => {
+    const w = r?.config?.properties?.contextWindow;
+    return Number.isFinite(w) && w > 0 ? w : null;
+  };
+  if (providerId) {
+    for (const r of rules) {
+      if (r?.providerId === providerId && r?.modelId === modelId) {
+        const w = pick(r);
+        if (w) return w;
+      }
+    }
+  }
+  for (const r of rules) {
+    if (r?.modelId === modelId) {
+      const w = pick(r);
+      if (w) return w;
+    }
+  }
+  return null;
+}
+
+function contextWindowFromBuiltin(modelId) {
+  const f = builtinConfigFile();
+  if (!f) return null;
+  const rules = readJsonCached(f)?.config?.modelConfigRules?.modelRules;
+  if (!Array.isArray(rules)) return null;
+  let hit = null;
+  for (const r of rules) {
+    const w = r?.config?.properties?.contextWindow;
+    if (!Number.isFinite(w) || w <= 0) continue;
+    try {
+      if (new RegExp(`^(?:${r.modelMatch})$`).test(modelId)) hit = w;
+    } catch {}
+  }
+  return hit;
+}
+
+export function resolveContextWindow(modelId, providerId) {
+  if (!modelId) return null;
+  return contextWindowFromProviderConfig(modelId, providerId) ?? contextWindowFromBuiltin(modelId);
+}
+
 // ---------- 统计聚合 ----------
 
 export async function computeSessionStats(opts = {}) {
@@ -260,8 +394,8 @@ export async function computeSessionStats(opts = {}) {
             SUM(CASE WHEN status='completed' AND time_to_first_token_ms IS NOT NULL THEN 1 ELSE 0 END) AS ttft_n,
             MAX(started_at) AS last_started_at
        FROM model_usage WHERE session_id='${SID}' AND query_source='main_turn'`,
-    // 2 最近一次请求（上下文占用 + 当前模型）
-    `SELECT model_id, input_tokens, output_tokens, duration_ms, time_to_first_token_ms, started_at, status
+    // 2 最近一次请求（上下文占用 + 当前模型：模型 + provider 用于查上下文窗口）
+    `SELECT model_id, provider_id, input_tokens, output_tokens, duration_ms, time_to_first_token_ms, started_at, status
        FROM model_usage
       WHERE session_id='${SID}' AND query_source='main_turn' AND status='completed'
       ORDER BY started_at DESC LIMIT 1`,
@@ -307,6 +441,14 @@ export async function computeSessionStats(opts = {}) {
 
   const liveRow = (a.running_rows ?? 0) > 0;
 
+  // 上下文占用：已用 = 最近一次已完成主轮请求的 input_tokens（含缓存读，即那次请求的
+  // 完整提示词规模）；窗口 = 模型配置里的 contextWindow。缺任一项则三个字段都不给，
+  // 渲染端隐藏圆环。
+  const contextTokens = last?.input_tokens ?? null;
+  const contextWindow = resolveContextWindow(last?.model_id, last?.provider_id);
+  const contextPercent =
+    contextTokens != null && contextWindow ? Math.min(100, Math.round((contextTokens / contextWindow) * 100)) : null;
+
   return {
     available: true,
     version: 1,
@@ -342,7 +484,9 @@ export async function computeSessionStats(opts = {}) {
       cacheWriteTokens: cacheWrite,
       inputTokens,
       outputTokens,
-      contextTokens: last?.input_tokens ?? null,
+      contextTokens,
+      contextWindow,
+      contextPercent,
       model: last?.model_id ?? null,
       lastActivityAt: a.last_started_at ?? sess?.time_updated ?? null,
     },

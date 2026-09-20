@@ -1,24 +1,32 @@
-// session-stats-bar.js — 注入 ZCode 渲染器的会话统计条（双 pill + 点击弹层）
+// session-stats-bar.js — 注入 ZCode 渲染器的会话统计条（双 pill + 上下文圆环 + 弹层）
 //
 // 由 patch-app.mjs 注入 index.html（<script type="module" src="./assets/session-stats-bar.js">）。
 // 职责：
-//   1. 在输入框下方留白区渲染两个独立统计 pill（对齐 DeepSeek Harness 官方
-//      「双图标 pill + 双弹层」设计）：
+//   1. 在输入框下方留白区渲染一条统计行（对齐 DeepSeek Harness 官方
+//      「双图标 pill + 上下文圆环 + 点击弹层」设计，含 2026-09-17 官方把
+//      ContextMeter 并入 composer 统计行的变更）：
 //        - 仪表盘 pill：N 轮 M 步 · X tok/s，点击打开「会话统计」弹层
 //        - 数据库 pill：紧凑总量 tok · 缓存命中 P%，点击打开「Token 用量」弹层
+//        - 上下文圆环 + 百分比（位于两个 pill 之后），点击打开「上下文容量」弹层
 //   2. 每秒从本地统计守护进程（127.0.0.1:47771/v1/stats）拉取数据并渲染，
 //      弹层打开期间随轮询同步刷新
 //   3. daemon 未就绪（如 ZCode 刚重启、hook 尚未拉起 daemon）时显示等待占位，
-//      一旦就绪立即显示真实指标 —— 永不隐藏
+//      一旦就绪立即显示真实指标 —— 永不隐藏（圆环仅在有模型窗口数据时出现，
+//      与官方 contextOccupancy 无容量数据即不渲染一致）
 // 弹层交互对齐官方 stat-dialog 模块：portal 到 body、锚定触发器上方、
-// 点击外部/Escape 关闭、两个弹层互斥（同一时刻至多开一个）。
-// 数据由 session-stats 插件的守护进程从 ~/.zcode/cli/db/db.sqlite 聚合而来。
+// 点击外部/Escape 关闭、弹层互斥（同一时刻至多开一个）。
+// 数据由 session-stats 插件的守护进程从 ~/.zcode/cli/db/db.sqlite 聚合而来；
+// 上下文窗口取自 ZCode 的模型配置（见 core/stats-core.mjs resolveContextWindow）。
 // token 由 patch-app.mjs 通过 --token 注入（与 ~/.zcode/session-stats/daemon-token 一致），
 // 占位符 __ZC_STATS_TOKEN__ 在烘焙时被替换。
 
 const DEFAULT_PORT = 47771;
 const POLL_MS = 1000;
 const TOKEN = "__ZC_STATS_TOKEN__";
+
+// 上下文圆环几何（对齐官方 ContextMeter：14px 视框、r=5.5、2px 描边）
+const RING_R = 5.5;
+const RING_C = 2 * Math.PI * RING_R;
 
 const CSS = `
 [data-zcstats-bar] {
@@ -77,6 +85,24 @@ const CSS = `
   display: inline-flex;
   color: var(--color-foreground-subtlest, #a1a1aa);
   flex: none;
+}
+/* 上下文占用圆环（对齐官方 ContextMeter：14px 视框、r5.5、2px 描边、-90° 起画） */
+[data-zcstats-bar] .zcstats-ring {
+  display: inline-flex;
+  flex: none;
+  color: var(--color-foreground-subtle, #71717a);
+}
+[data-zcstats-bar] .zcstats-ring svg { display: block; }
+[data-zcstats-bar] .zcstats-ring-track {
+  fill: none;
+  stroke: var(--color-border, #e4e4e7);
+  stroke-width: 2;
+}
+[data-zcstats-bar] .zcstats-ring-fill {
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 2;
+  stroke-linecap: round;
 }
 [data-zcstats-bar] .zcstats-pill-text { overflow: hidden; text-overflow: ellipsis; }
 [data-zcstats-bar] .zcstats-dot {
@@ -138,6 +164,27 @@ const CSS = `
   color: var(--color-foreground-subtle, #71717a);
   font-variant-numeric: tabular-nums;
 }
+[data-zcstats-dialog] .zcstats-dialog-headline { color: var(--color-foreground-subtle, #71717a); font-weight: 400; }
+[data-zcstats-dialog] .zcstats-dialog-headline:empty { display: none; }
+[data-zcstats-dialog] .zcstats-dialog-percent { font-weight: 500; color: var(--color-foreground, #18181b); }
+[data-zcstats-dialog] .zcstats-dialog-head .zcstats-ring { color: var(--color-foreground-subtle, #71717a); }
+/* 上下文占用条：无来源拆分数据时按官方降级路径渲染单色段 */
+[data-zcstats-dialog] .zcstats-dialog-meter {
+  display: flex;
+  gap: 1px;
+  height: 4px;
+  margin: 9px 14px 7px;
+  border-radius: 999px;
+  background: var(--color-border, #e4e4e7);
+  overflow: hidden;
+}
+[data-zcstats-dialog] .zcstats-dialog-meter-seg {
+  flex: none;
+  min-width: 2px;
+  height: 100%;
+  border-radius: 1px;
+  background: var(--color-foreground-subtle, #71717a);
+}
 [data-zcstats-dialog] .zcstats-dialog-rows { margin: 0; padding: 7px 14px 5px; }
 [data-zcstats-dialog] .zcstats-dialog-row {
   display: flex;
@@ -169,8 +216,19 @@ const ICON_DB =
   '<path d="M2.7 3.8v8.4c0 1.16 2.37 2.1 5.3 2.1s5.3-.94 5.3-2.1V3.8"/>' +
   '<path d="M2.7 8c0 1.16 2.37 2.1 5.3 2.1s5.3-.94 5.3-2.1"/></svg>';
 
+// 上下文占用圆环：轨道整圈 + 进度弧（stroke-dasharray），与官方 ContextMeter 一致
+function ringSvg(percent) {
+  const arc = (RING_C * Math.max(0, Math.min(100, percent == null ? 0 : percent))) / 100;
+  return (
+    '<svg viewBox="0 0 14 14" width="14" height="14" aria-hidden="true">' +
+    `<circle class="zcstats-ring-track" cx="7" cy="7" r="${RING_R}"/>` +
+    `<circle class="zcstats-ring-fill" cx="7" cy="7" r="${RING_R}" ` +
+    `stroke-dasharray="${arc} ${RING_C}" transform="rotate(-90 7 7)"/></svg>`
+  );
+}
+
 let bar = null;
-let pills = {}; // { time, usage }
+let pills = {}; // { time, usage, context }
 let lastData = null;
 let lastViewKey;
 let failCount = 0;
@@ -227,6 +285,10 @@ function hasUsage(t) {
 function billedTotal(t) {
   return (t.inputTokens || 0) + (t.cacheWriteTokens || 0) + (t.outputTokens || 0);
 }
+// 有模型窗口 + 已用 token 才能画圆环（官方 contextOccupancy：缺任一即不渲染）
+function hasContext(t) {
+  return !!(t && t.contextTokens != null && t.contextWindow > 0 && t.contextPercent != null);
+}
 // 缓存命中率展示：>99.5% 显示 100%（官方细则）；denom 与 daemon 口径一致
 function cacheHitDisplay(t) {
   if (t.cacheHitPct == null) return null;
@@ -266,7 +328,7 @@ function buildPill(kind, withDot, icon) {
     el.appendChild(dot);
   }
   const iconSpan = document.createElement("span");
-  iconSpan.className = "zcstats-pill-icon";
+  iconSpan.className = "zcstats-pill-icon" + (kind === "context" ? " zcstats-ring" : "");
   iconSpan.innerHTML = icon;
   const text = document.createElement("span");
   text.className = "zcstats-pill-text";
@@ -289,8 +351,9 @@ function buildBar() {
   pills = {
     time: buildPill("time", true, ICON_GAUGE),
     usage: buildPill("usage", false, ICON_DB),
+    context: buildPill("context", false, ringSvg(0)),
   };
-  el.append(pills.time, pills.usage);
+  el.append(pills.time, pills.usage, pills.context);
   return el;
 }
 
@@ -304,9 +367,31 @@ function setWaitState() {
   bar.classList.add("zcstats-wait");
   bar.classList.remove("zcstats-live");
   pills.usage.style.display = "none";
+  pills.context.style.display = "none";
   setPillText("time", "会话统计 · 等待本地服务…");
   setPillClickable(pills.time, false, "统计守护进程尚未就绪，正在自动重试");
   closeDialog();
+}
+
+// 上下文圆环：百分比读数 + 圆环进度；无模型窗口/已用数据时整项隐藏（官方同此）
+function updateContextPill(t) {
+  const pill = pills.context;
+  if (!pill) return;
+  if (!hasContext(t)) {
+    pill.style.display = "none";
+    setPillClickable(pill, false, "上下文容量：暂无模型上下文窗口数据");
+    return;
+  }
+  pill.style.display = "";
+  const p = t.contextPercent;
+  const fill = pill.querySelector(".zcstats-ring-fill");
+  if (fill) fill.setAttribute("stroke-dasharray", `${(RING_C * p) / 100} ${RING_C}`);
+  setPillText("context", `${p}%`);
+  setPillClickable(
+    pill,
+    true,
+    `上下文容量：已用 ${p}%，${fmtTokens(t.contextTokens)} / ${fmtTokens(t.contextWindow)} tok，点击查看详情`
+  );
 }
 
 function render(data) {
@@ -322,6 +407,7 @@ function render(data) {
     setPillText("usage", "0 tok · 缓存命中 —");
     setPillClickable(pills.time, false, "会话统计：当前会话暂无统计数据");
     setPillClickable(pills.usage, false, "Token 用量：当前会话暂无统计数据");
+    updateContextPill(null);
     syncOpenDialog();
     bar.style.display = "";
     return;
@@ -348,6 +434,7 @@ function render(data) {
     usageClickable,
     `Token 用量：共 ${fmtExact(billedTotal(t))} tok，缓存命中 ${p != null ? p + "%" : "—"}，点击查看详情`
   );
+  updateContextPill(t);
   syncOpenDialog();
   bar.style.display = "";
 }
@@ -357,6 +444,7 @@ function render(data) {
 const DIALOG_META = {
   time: { title: "会话统计" },
   usage: { title: "Token 用量" },
+  context: { title: "上下文容量" },
 };
 
 function dialogRows(rows) {
@@ -375,6 +463,10 @@ function dialogRows(rows) {
 function updateDialog() {
   if (!dialog) return;
   const t = lastData && lastData.available ? lastData.totals : null;
+  if (dialog.kind === "context") {
+    updateContextDialog(t);
+    return;
+  }
   let head;
   let rows;
   if (dialog.kind === "time") {
@@ -407,6 +499,24 @@ function updateDialog() {
   }
   dialog.root.innerHTML =
     `<div class="zcstats-dialog-head">${head}</div>` + dialogRows(rows);
+}
+
+// 「上下文容量」弹层：标题行「上下文已用 P%」+ 右侧「已用 / 窗口」紧凑读数 + 占用条。
+// 官方有 contextBreakdown 时按来源画分段条（系统提示 / 工具 / 对话）；ZCode 侧拿不到
+// 该来源拆分，走官方降级路径：单色段条（宽度 = 百分比）。
+function updateContextDialog(t) {
+  const ok = hasContext(t);
+  const p = ok ? t.contextPercent : 0;
+  const head =
+    `<span class="zcstats-pill-icon zcstats-ring">${ringSvg(p)}</span>` +
+    `<span class="zcstats-dialog-headline">上下文已用</span>` +
+    (ok ? `<span class="zcstats-dialog-percent">${p}%</span>` : "") +
+    (ok
+      ? `<span class="zcstats-dialog-sum">${fmtTokens(t.contextTokens)} / ${fmtTokens(t.contextWindow)} tok</span>`
+      : "");
+  dialog.root.innerHTML =
+    `<div class="zcstats-dialog-head">${head}</div>` +
+    `<div class="zcstats-dialog-meter"><div class="zcstats-dialog-meter-seg" style="width:${p}%"></div></div>`;
 }
 
 // 锚定 pill 上方 gap 8px，视口 12px 边距钳制；上方放不下时落下方
@@ -674,6 +784,14 @@ function reportDiag(view) {
           }
         : null,
       dialog: dialog ? dialog.kind : null,
+      ring: pills.context
+        ? {
+            shown: pills.context.style.display !== "none",
+            percent: (lastData && lastData.totals && lastData.totals.contextPercent) ?? null,
+            used: (lastData && lastData.totals && lastData.totals.contextTokens) ?? null,
+            window: (lastData && lastData.totals && lastData.totals.contextWindow) ?? null,
+          }
+        : null,
       settingsOpen: !!document.querySelector('[data-testid="settings-page"]'),
       paneSessionId: pane ? pane.getAttribute("data-session-id") : null,
       view,
