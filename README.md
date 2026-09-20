@@ -308,6 +308,26 @@ ZCode 模型配置 ◄──只读─┴─ daemon.mjs ──HTTP 127.0.0.1:4777
 - 排障：渲染端每 15s 把视图/定位内部状态上报给 daemon，写在
   `~/.zcode/session-stats/daemon.log`（含圆环的 shown/percent/used/window）。
 
+### Kimi Code 桌面版（`kimi-code/`）
+
+同一套统计条思路移植到 **Kimi Code 桌面版**（`Kimi Code.app`）：界面产物在
+`Contents/Resources/desktop-dist/`，由 `app://renderer/` 协议直接按文件提供，因此往
+`index.html` 注入一行 `<script>` 即可——同样不改 asar、不跑守护进程、不开端口。
+
+数据来自应用自己的 WebSocket 事件流（`/api/v1/ws`）：脚本用 `Proxy` 包住
+`window.WebSocket`（静态成员/原型/`instanceof` 全部保持原样，只观察不打搅），解析
+`turn.step.completed`（usage 与 timing）、`transcript.reset` / `transcript.ops`（快照与
+增量，按 stepId 去重）、`event.session.work_changed`（服务端 busy）、
+`subagent.spawned`（模型名）等真实帧。
+
+```bash
+bash kimi-code/install.sh     # 安装（幂等，可重复执行）
+bash kimi-code/uninstall.sh   # 还原（白屏急救）
+bash kimi-code/doctor.sh      # 自检（含无头 Chrome 渲染层冒烟测试）
+```
+
+细节、统计口径与白屏急救说明见 [`kimi-code/README.md`](kimi-code/README.md)。
+
 ---
 
 ## File structure 文件结构
@@ -331,6 +351,13 @@ app-patch/
   set-node-options.mjs        User-level NODE_OPTIONS read/merge/remove (Windows)
 lib/
   zcenv.sh                    Cross-platform env detection + daemon lifecycle
+kimi-code/                    Kimi Code desktop port (injects into desktop-dist, no daemon)
+  renderer/kimi-session-stats.js  Stats bar for Kimi Code (WS frame sniffer + pill UI)
+  install.sh / uninstall.sh   Inject / restore (idempotent; uninstall is the blank-screen rescue)
+  doctor.sh                   Health check (injection state, syntax, tests, renderer smoke)
+  test/stats-core.test.mjs    Core unit tests incl. replay of recorded real frames
+  test/renderer-smoke.test.mjs  Headless-Chrome guard against the blank-window freeze
+  fix.command                 Double-click rescue: restore then install the current build
 install.sh / uninstall.sh     One-shot install / uninstall (cross-platform)
 doctor.sh                     One-shot health check
 ```
