@@ -63,15 +63,23 @@ window.__pushFrame = function (frame) {
 
 // The composer appears late (like the real SPA) and the app keeps re-rendering
 // unrelated nodes afterwards — every one of those mutations is a chance for a
-// self-feeding observer to lock the renderer up.
+// self-feeding observer to lock the renderer up. The two fetches replay what
+// the real app does when a session (re)opens: status + transcript.
 const APP_JS = `
 setTimeout(function () {
   var host = document.createElement('div');
   host.className = 'composer';
   host.innerHTML = '<div class="composer-card"><textarea></textarea></div>';
   document.getElementById('app').appendChild(host);
+  // the desktop shell records the embedded server's origin for the app; the
+  // bar reads it from here to reach /snapshot on its own
+  sessionStorage.setItem('kimi-desktop-server-origin', location.origin);
   // the app's own event stream — the script must observe this connection
   window.__sock = new window.WebSocket('ws://127.0.0.1:' + location.port + '/api/v1/ws');
+  window.__rest = Promise.all([
+    fetch('/api/v1/sessions/test-session/status').then(function (r) { return r.json(); }),
+    fetch('/api/v1/sessions/test-session/transcript?agent_id=main').then(function (r) { return r.json(); })
+  ]);
   setInterval(function () {
     var old = document.getElementById('churn');
     if (old) old.remove();
@@ -82,6 +90,62 @@ setTimeout(function () {
   }, 120);
 }, 40);
 `;
+
+const STATUS_BODY = {
+  code: 0,
+  msg: 'success',
+  data: {
+    busy: false,
+    model: 'goat/deepseek/deepseek-v4.1-flash',
+    context_tokens: 246029,
+    max_context_tokens: 1000000,
+    context_usage: 0.246029
+  }
+};
+
+// the inventory as the live server sends it: turn items with steps, no usage
+const TRANSCRIPT_BODY = {
+  code: 0,
+  msg: 'success',
+  data: {
+    agent_id: 'main',
+    items: [
+      {
+        kind: 'turn',
+        turnId: 't0',
+        ordinal: 0,
+        state: 'completed',
+        steps: [
+          { kind: 'step', stepId: 't0.0', ordinal: 0 },
+          { kind: 'step', stepId: 't0.1', ordinal: 1 }
+        ]
+      }
+    ]
+  }
+};
+
+// GET /sessions/<id>/snapshot — the whole-session tally. The app never asks
+// for it; the bar has to fetch it on its own.
+const SNAPSHOT_BODY = {
+  code: 0,
+  msg: 'success',
+  data: {
+    as_of_seq: 1778,
+    session: {
+      id: 'test-session',
+      busy: false,
+      agent_config: { model: 'goat/deepseek/deepseek-v4.1-flash' },
+      usage: {
+        input_tokens: 400000,
+        output_tokens: 100000,
+        cache_read_tokens: 1000000,
+        cache_creation_tokens: 0,
+        context_tokens: 246029,
+        context_limit: 1000000
+      }
+    }
+  }
+};
 
 function pageHtml() {
   const script = readFileSync(SCRIPT, 'utf8');
@@ -115,10 +179,28 @@ test('renderer smoke: the bar mounts and the app keeps running', { timeout: 9000
   }
 
   const html = pageHtml();
+  let snapshotHits = 0;
   const server = createServer((req, res) => {
-    if (req.url === '/kimi-session-stats.js') {
+    const url = req.url || '';
+    if (url.startsWith('/kimi-session-stats.js')) {
       res.writeHead(200, { 'content-type': 'text/javascript' });
       res.end(readFileSync(SCRIPT, 'utf8'));
+      return;
+    }
+    if (url.startsWith('/api/v1/sessions/test-session/snapshot')) {
+      snapshotHits += 1;
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify(SNAPSHOT_BODY));
+      return;
+    }
+    if (url.startsWith('/api/v1/sessions/test-session/status')) {
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify(STATUS_BODY));
+      return;
+    }
+    if (url.startsWith('/api/v1/sessions/test-session/transcript')) {
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify(TRANSCRIPT_BODY));
       return;
     }
     res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' });
@@ -212,7 +294,48 @@ test('renderer smoke: the bar mounts and the app keeps running', { timeout: 9000
   })()`);
   assert.equal(mounted.value, 'ok', 'the bar must be attached under the composer');
 
-  // a frame the app would deliver: server-side cumulative totals
+  // The two REST responses the app fetched on open must fill the bar on their
+  // own: the turn/step inventory comes from /transcript, the context meter and
+  // model from /status — the only data a session opened long after its last
+  // turn can offer.
+  const restRead = async () =>
+    String(
+      (
+        await evaluate(`(function () {
+          var bar = document.getElementById('kimi-session-stats');
+          var gauge = bar && bar.querySelector('.ks-gauge-text');
+          var ring = bar && bar.querySelector('.ks-ring-label');
+          return ((gauge && gauge.textContent) || '') + ' | ' + ((ring && ring.textContent) || '');
+        })()`)
+      ).value
+    );
+  const inventory = await waitFor(async () => {
+    const text = await restRead();
+    return /(1\s*(轮|turns?))/.test(text) ? text : null;
+  }, 6000);
+  assert.ok(inventory, 'the transcript snapshot must restore the turn count');
+  assert.match(inventory, /(2\s*(步|steps?))/, `step count from the snapshot (got ${JSON.stringify(inventory)})`);
+  assert.match(inventory, /25%/, `context ring from /status (got ${JSON.stringify(inventory)})`);
+
+  // The app never asks the server for the session's cumulative usage, so the
+  // bar reads GET /sessions/<id>/snapshot itself, authenticating with the
+  // subprotocol token it observed on the app's own WebSocket handshake.
+  const cumulative = await waitFor(async () => {
+    const t = String(
+      (
+        await evaluate(
+          "(function(){var e=document.querySelector('#kimi-session-stats .ks-tokens-text');return e?e.textContent:''})()"
+        )
+      ).value
+    );
+    return /500k/.test(t) ? t : null;
+  }, 9000);
+  assert.ok(cumulative, `the bar must read the server tally itself (got ${JSON.stringify(cumulative)})`);
+  assert.ok(snapshotHits >= 1, 'GET /snapshot must be issued by the bar itself');
+  assert.match(cumulative, /71%/, `cache hit comes from the server tally (got ${JSON.stringify(cumulative)})`);
+
+  // a live frame for the same session: its context meter wins (it is fresher),
+  // while the larger server tally keeps the totals
   await evaluate(`window.__pushFrame(${JSON.stringify({
     type: 'agent.status.updated',
     session_id: 'test-session',
@@ -224,7 +347,7 @@ test('renderer smoke: the bar mounts and the app keeps running', { timeout: 9000
       usage: { total: { inputOther: 900, output: 90, inputCacheRead: 100, inputCacheCreation: 0 } }
     }
   })})`);
-  await new Promise((r) => setTimeout(r, 300));
+  await new Promise((r) => setTimeout(r, 400));
 
   const text = await evaluate(`(function () {
     var tokens = document.querySelector('#kimi-session-stats .ks-tokens-text');
@@ -233,12 +356,33 @@ test('renderer smoke: the bar mounts and the app keeps running', { timeout: 9000
     return (tokens ? tokens.textContent : '') + ' | ' + (gauge ? gauge.textContent : '') + ' | ' + (ring ? ring.textContent : '');
   })()`);
   assert.equal(text.blocked, undefined, 'renderer must still answer after rendering a frame');
-  assert.match(String(text.value), /990/, `token pill must show the server total (got ${JSON.stringify(text.value)})`);
-  assert.match(String(text.value), /15%/, `context ring must show 15% (got ${JSON.stringify(text.value)})`);
+  assert.match(String(text.value), /500k/, `the larger server tally still wins (got ${JSON.stringify(text.value)})`);
+  assert.match(String(text.value), /15%/, `the live frame refreshes the context meter (got ${JSON.stringify(text.value)})`);
 
   // still alive after the app kept churning under the observer
   const alive = await evaluate('new Promise((r)=>requestAnimationFrame(()=>r("frame")))', 4000);
   assert.equal(alive.value, 'frame', 'the renderer must still be responsive (no observer feedback loop)');
+
+  // the skin must stay aligned with the ZCode build: one pill shell per
+  // metric with a 14px outline icon, and the official ring geometry
+  const skin = await evaluate(`(function () {
+    var bar = document.getElementById('kimi-session-stats');
+    var pills = Array.prototype.slice.call(bar.querySelectorAll('.ks-pill'));
+    var ring = bar.querySelector('.ks-ring svg');
+    var cs = getComputedStyle(pills[0]);
+    return {
+      pills: pills.length,
+      icons: pills.map(function (p) { return p.querySelectorAll('.ks-pill-icon svg').length; }).join(','),
+      viewBox: ring ? ring.getAttribute('viewBox') : 'none',
+      radius: cs.borderTopLeftRadius,
+      size: cs.fontSize
+    };
+  })()`);
+  assert.equal(skin.value.pills, 3, 'gauge + usage + context');
+  assert.equal(skin.value.icons, '1,1,1', 'every pill carries an inline icon');
+  assert.equal(skin.value.viewBox, '0 0 14 14', 'official ContextMeter ring geometry');
+  assert.match(String(skin.value.radius), /999/, 'pills use the 999px capsule radius');
+  assert.match(String(skin.value.size), /11\.5px/, 'pills use the 11.5px stats-row type scale');
 
   ws.close();
 });

@@ -310,23 +310,32 @@ ZCode 模型配置 ◄──只读─┴─ daemon.mjs ──HTTP 127.0.0.1:4777
 
 ### Kimi Code 桌面版（`kimi-code/`）
 
-同一套统计条思路移植到 **Kimi Code 桌面版**（`Kimi Code.app`）：界面产物在
+同一套统计条移植到 **Kimi Code 桌面版**（`Kimi Code.app`）：界面产物在
 `Contents/Resources/desktop-dist/`，由 `app://renderer/` 协议直接按文件提供，因此往
-`index.html` 注入一行 `<script>` 即可——同样不改 asar、不跑守护进程、不开端口。
+`index.html` 注入一行 `<script>` 即可——不改 asar、不跑守护进程、不开端口（唯一的主动请求是
+每个会话读一次本机 server 的 `/snapshot`）。皮肤与 ZCode 版一致：官方 DSH 的 `999px` 胶囊、
+14px 描边图标（仪表盘 / 数据库）、ContextMeter 几何的圆环、11.5px 等宽数字。
 
-数据来自应用自己的 WebSocket 事件流（`/api/v1/ws`）：脚本用 `Proxy` 包住
-`window.WebSocket`（静态成员/原型/`instanceof` 全部保持原样，只观察不打搅），解析
-`turn.step.completed`（usage 与 timing）、`transcript.reset` / `transcript.ops`（快照与
-增量，按 stepId 去重）、`event.session.work_changed`（服务端 busy）、
-`subagent.spawned`（模型名）等真实帧。
+取数三条通道（格式与字段都在 `desktop-dist` 的前端 bundle 与真实响应里核对过）：
+
+- **WS 观察**：`Proxy` 包住 `window.WebSocket`（静态成员/原型/`instanceof` 保持原样），解析
+  `turn.step.completed`（usage 与 timing）、`transcript.reset|ops`（轮/步清单）、
+  `event.session.work_changed`（busy）、`subagent.spawned`（模型名）
+- **HTTP 嗅探**：`Proxy` 包住 `window.fetch`，只读 `res.clone()`，解析应用自己请求的
+  `GET /sessions/<id>/status`（模型 + 上下文）与 `GET /sessions/<id>/transcript`（清单）
+- **HTTP 自取**：`GET /sessions/<id>/snapshot`——应用从不请求它，但整会话累计 token 只在这里
+  （`session.usage`）；统计条自己去读，每会话一次，loopback 请求服务端不校验凭据
+
+于是历史会话也能显示 轮数 / 步数 / 总量 / 缓存命中 / 上下文 / 模型；只有"输出速度"与
+"首 token 平均"需要实时帧里的每步耗时（服务端不下发），纯历史会话显示 `—`，会话一有新活动即出现。
 
 ```bash
 bash kimi-code/install.sh     # 安装（幂等，可重复执行）
 bash kimi-code/uninstall.sh   # 还原（白屏急救）
-bash kimi-code/doctor.sh      # 自检（含无头 Chrome 渲染层冒烟测试）
+bash kimi-code/doctor.sh      # 自检（注入状态 + 单测 + 无头 Chrome 渲染层冒烟测试）
 ```
 
-细节、统计口径与白屏急救说明见 [`kimi-code/README.md`](kimi-code/README.md)。
+细节（数据源实测记录、统计口径、已知边界、白屏急救）见 [`kimi-code/README.md`](kimi-code/README.md)。
 
 ---
 
@@ -352,11 +361,11 @@ app-patch/
 lib/
   zcenv.sh                    Cross-platform env detection + daemon lifecycle
 kimi-code/                    Kimi Code desktop port (injects into desktop-dist, no daemon)
-  renderer/kimi-session-stats.js  Stats bar for Kimi Code (WS frame sniffer + pill UI)
+  renderer/kimi-session-stats.js  Stats bar: WS sniffer + REST observer + own /snapshot read, ZCode-aligned skin
   install.sh / uninstall.sh   Inject / restore (idempotent; uninstall is the blank-screen rescue)
   doctor.sh                   Health check (injection state, syntax, tests, renderer smoke)
-  test/stats-core.test.mjs    Core unit tests incl. replay of recorded real frames
-  test/renderer-smoke.test.mjs  Headless-Chrome guard against the blank-window freeze
+  test/stats-core.test.mjs    Core unit tests incl. replay of recorded real frames and live-shaped REST payloads
+  test/renderer-smoke.test.mjs  Headless-Chrome guard: no blank-window freeze, REST + /snapshot fill the bar
   fix.command                 Double-click rescue: restore then install the current build
 install.sh / uninstall.sh     One-shot install / uninstall (cross-platform)
 doctor.sh                     One-shot health check

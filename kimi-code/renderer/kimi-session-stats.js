@@ -23,8 +23,14 @@
   var USAGE_FIELDS = [
     { key: 'inputOther', aliases: ['inputOther', 'input_tokens', 'prompt_tokens'] },
     { key: 'output', aliases: ['output', 'output_tokens', 'completion_tokens'] },
-    { key: 'cacheRead', aliases: ['inputCacheRead', 'cache_read_input_tokens', 'cache_read', 'cached_tokens'] },
-    { key: 'cacheCreate', aliases: ['inputCacheCreation', 'cache_creation_input_tokens', 'cache_creation'] }
+    {
+      key: 'cacheRead',
+      aliases: ['inputCacheRead', 'cache_read_input_tokens', 'cache_read_tokens', 'cache_read', 'cached_tokens']
+    },
+    {
+      key: 'cacheCreate',
+      aliases: ['inputCacheCreation', 'cache_creation_input_tokens', 'cache_creation_tokens', 'cache_creation']
+    }
   ];
   var TIMING_KEYS = [
     'llmFirstTokenLatencyMs',
@@ -94,12 +100,22 @@
   function newSession(id) {
     return {
       id: id,
-      // stepId -> { usage, timing, turnId, agentId }. Upserts make every
-      // channel idempotent, so a step is never counted twice.
+      // stepId -> { usage, timing, turnId, ordinal, agentId }. Upserts make
+      // every channel idempotent, so a step is never counted twice.
       steps: new Map(),
       turns: new Set(),
+      // Turn/step inventory of a transcript snapshot ("turnId:ordinal" keys).
+      // The snapshot carries the turn and step list but no token usage, so it
+      // is the only way a freshly opened session learns how many turns and
+      // steps happened before this window; usage still comes from live frames.
+      histTurns: new Set(),
+      histSteps: new Set(),
       // agentId -> cumulative usage as reported by the server (authoritative)
       auth: new Map(),
+      // Lowest turn count the server has told us about (phase.turnId is a
+      // per-session 0-based counter), for sessions whose turn list we never
+      // receive — the transcript snapshot of an old session is windowed.
+      seedTurns: 0,
       model: '',
       contextTokens: 0,
       contextMax: 0,
@@ -107,6 +123,19 @@
       phase: '',
       updatedAt: 0
     };
+  }
+
+  // Turn ids arrive as "t3" in snapshots and as 3 in live frames; normalise so
+  // the two channels can be compared.
+  function normTurnId(raw) {
+    if (typeof raw === 'number' && isFinite(raw)) return String(raw);
+    if (typeof raw !== 'string' || !raw) return null;
+    return raw.charAt(0) === 't' ? raw.slice(1) : raw;
+  }
+
+  function stepKey(turnId, ordinal) {
+    var t = normTurnId(turnId);
+    return t !== null && typeof ordinal === 'number' ? t + ':' + ordinal : null;
   }
 
   function sessionOf(store, id) {
@@ -126,6 +155,7 @@
       if (entry.timing) prev.timing = entry.timing;
       if (entry.agentId) prev.agentId = entry.agentId;
       if (typeof entry.turnId !== 'undefined') prev.turnId = entry.turnId;
+      if (typeof entry.ordinal === 'number') prev.ordinal = entry.ordinal;
     } else {
       s.steps.set(stepId, entry);
     }
@@ -145,33 +175,155 @@
 
   function agentIdOf(frame) {
     var p = frame.payload;
-    var id = p && typeof p.agentId === 'string' ? p.agentId : null;
+    // live frames use camelCase, the transcript/subscribe payloads snake_case
+    var id = p && (typeof p.agentId === 'string' ? p.agentId : typeof p.agent_id === 'string' ? p.agent_id : null);
     return id || MAIN_AGENT;
   }
 
-  // Rebuild the step/turn tables from a transcript snapshot. The server sends
-  // transcript.reset with the full step history when a session is (re)opened.
+  // Rebuild the turn/step inventory from a transcript snapshot. The server
+  // sends it (transcript.reset) whenever a session is (re)opened, and the REST
+  // twin is GET /sessions/<id>/transcript.
+  //
+  // A turn item looks like {kind:'turn', turnId:'t1', state, steps:[{kind,
+  // stepId, turnId, ordinal, state, frames}]}: it carries the *inventory* but
+  // no token usage at all, so counting must not depend on `usage` being there
+  // (live turn.step.completed frames remain the only usage source).
+  function applySnapshotItems(s, items) {
+    if (!Array.isArray(items)) return false;
+    s.histTurns.clear();
+    s.histSteps.clear();
+    for (var i = 0; i < items.length; i++) {
+      var item = items[i];
+      if (!item || item.kind !== 'turn') continue;
+      var turnId = normTurnId(item.turnId);
+      if (turnId !== null) s.histTurns.add(turnId);
+      var steps = Array.isArray(item.steps) ? item.steps : [];
+      for (var j = 0; j < steps.length; j++) {
+        var st = steps[j];
+        if (!st) continue;
+        var ordinal = typeof st.ordinal === 'number' ? st.ordinal : j;
+        if (turnId !== null) s.histSteps.add(turnId + ':' + ordinal);
+        // Usage is absent on this wire today; keep the branch so a future
+        // server that does send it is picked up for free.
+        if (st.usage) {
+          upsertStep(s, st.stepId || turnId + ':' + ordinal, {
+            usage: normalizeUsage(st.usage),
+            timing: pickTiming(st.timing),
+            turnId: item.turnId,
+            ordinal: ordinal,
+            agentId: MAIN_AGENT
+          });
+        }
+      }
+    }
+    return true;
+  }
+
   function applySnapshot(s, snapshot) {
     if (!snapshot || !Array.isArray(snapshot.items)) return false;
     s.steps.clear();
     s.turns.clear();
-    for (var i = 0; i < snapshot.items.length; i++) {
-      var item = snapshot.items[i];
-      if (!item || item.kind !== 'turn') continue;
-      if (typeof item.turnId !== 'undefined') s.turns.add(item.turnId);
-      var steps = Array.isArray(item.steps) ? item.steps : [];
-      for (var j = 0; j < steps.length; j++) {
-        var st = steps[j];
-        if (!st || !st.usage) continue;
-        s.steps.set(st.stepId || item.turnId + ':' + j, {
-          usage: normalizeUsage(st.usage),
-          timing: pickTiming(st.timing),
-          turnId: item.turnId,
-          agentId: MAIN_AGENT
-        });
+    applySnapshotItems(s, snapshot.items);
+    applyAgentMeta(s, snapshot.meta && snapshot.meta.agent);
+    return true;
+  }
+
+  // GET /sessions/<id>/snapshot — {session, messages, in_flight_turn, ...}.
+  // session.usage is the server's cumulative tally for the whole session
+  // (millions of tokens of history included), which is exactly what a session
+  // reopened hours later needs; nothing else on this wire carries it.
+  function applySnapshotPayload(s, data) {
+    var session = data && data.session;
+    if (!session || typeof session !== 'object') return false;
+    var touched = false;
+
+    var usage = session.usage;
+    if (usage && typeof usage === 'object') {
+      mergeAuthUsage(s, MAIN_AGENT, normalizeUsage(usage));
+      // context_tokens / context_limit ride along in the same object
+      if (typeof usage.context_tokens === 'number' && usage.context_tokens > 0) {
+        s.contextTokens = usage.context_tokens;
+      }
+      if (typeof usage.context_limit === 'number' && usage.context_limit > 0) {
+        s.contextMax = usage.context_limit;
+      }
+      touched = true;
+    }
+
+    var model = session.agent_config && session.agent_config.model;
+    if (typeof model === 'string' && model) {
+      s.model = model;
+      touched = true;
+    }
+    if (typeof session.busy === 'boolean') {
+      s.running = session.busy;
+      touched = true;
+    }
+    return touched;
+  }
+
+  // GET /sessions/<id>/status — the authoritative model + context meter, and
+  // the one source that works for a session opened long after its last turn.
+  function applySessionStatus(s, data) {
+    if (!data || typeof data !== 'object') return false;
+    var touched = false;
+    if (typeof data.model === 'string' && data.model) {
+      s.model = data.model;
+      touched = true;
+    }
+    if (typeof data.context_tokens === 'number' && data.context_tokens > 0) {
+      s.contextTokens = data.context_tokens;
+      touched = true;
+    }
+    if (typeof data.max_context_tokens === 'number' && data.max_context_tokens > 0) {
+      s.contextMax = data.max_context_tokens;
+      touched = true;
+    }
+    if (typeof data.context_usage === 'number' && data.context_usage > 0 && s.contextTokens === 0 && s.contextMax > 0) {
+      s.contextTokens = Math.round(data.context_usage * s.contextMax);
+      touched = true;
+    }
+    if (typeof data.busy === 'boolean') {
+      s.running = data.busy;
+      touched = true;
+    }
+    return touched;
+  }
+
+  // snapshot.meta.agent carries the model, the context meter and the agent's
+  // cumulative usage — the durable counterpart of the volatile status frame,
+  // and the only place a freshly opened session can learn its context window.
+  function applyAgentMeta(s, meta) {
+    if (!meta || typeof meta !== 'object') return false;
+    if (typeof meta.model === 'string' && meta.model) s.model = meta.model;
+    if (typeof meta.contextTokens === 'number' && meta.contextTokens > 0) {
+      s.contextTokens = meta.contextTokens;
+    }
+    if (typeof meta.maxContextTokens === 'number' && meta.maxContextTokens > 0) {
+      s.contextMax = meta.maxContextTokens;
+    }
+    if (typeof meta.contextUsage === 'number' && meta.contextUsage > 0 && s.contextMax > 0) {
+      s.contextTokens = Math.round(meta.contextUsage * s.contextMax);
+    }
+    if (meta.phase && typeof meta.phase.kind === 'string' && meta.phase.kind) {
+      s.phase = meta.phase.kind;
+      s.running = s.phase === 'running' || s.phase === 'tool_call' || s.phase === 'retrying';
+      if (typeof meta.phase.turnId === 'number' && meta.phase.turnId >= 0) {
+        s.seedTurns = Math.max(s.seedTurns, meta.phase.turnId + 1);
       }
     }
+    var total = meta.usage && meta.usage.total;
+    if (total) mergeAuthUsage(s, MAIN_AGENT, normalizeUsage(total));
     return true;
+  }
+
+  function mergeAuthUsage(s, agentId, normalized) {
+    var known = s.auth.get(agentId) || blankUsage();
+    // Authoritative totals can lag a frame or two behind this session's own
+    // accumulation; never let them walk backwards.
+    var merged = blankUsage();
+    for (var k in merged) merged[k] = Math.max(known[k], normalized[k]);
+    s.auth.set(agentId, merged);
   }
 
   function applyOps(s, ops) {
@@ -194,6 +346,7 @@
             usage: normalizeUsage(st.usage),
             timing: pickTiming(st.timing),
             turnId: typeof op.turnId !== 'undefined' ? op.turnId : st.turnId,
+            ordinal: typeof st.ordinal === 'number' ? st.ordinal : undefined,
             agentId: MAIN_AGENT
           });
         }
@@ -220,6 +373,7 @@
           usage: normalizeUsage(p.usage),
           timing: pickTiming(p),
           turnId: p.turnId,
+          ordinal: typeof p.step === 'number' ? p.step : undefined,
           agentId: agentId
         });
         touched = true;
@@ -240,11 +394,14 @@
         break;
 
       case 'transcript.reset':
-        if (applySnapshot(s, p.snapshot)) touched = true;
+        // Every agent has its own transcript; only the main one describes the
+        // session the bar reports on. Letting a subagent snapshot through
+        // would wipe the main inventory it was merged into.
+        if (agentId === MAIN_AGENT && applySnapshot(s, p.snapshot)) touched = true;
         break;
 
       case 'transcript.ops':
-        if (applyOps(s, p.ops)) touched = true;
+        if (agentId === MAIN_AGENT && applyOps(s, p.ops)) touched = true;
         break;
 
       case 'event.session.work_changed': {
@@ -284,15 +441,7 @@
           s.contextMax = p.maxContextTokens;
         }
         var total = p.usage && p.usage.total;
-        if (total) {
-          var normalized = normalizeUsage(total);
-          var known = s.auth.get(agentId) || blankUsage();
-          // Server-side cumulative totals are authoritative but can lag behind
-          // this session's own accumulation; never let them walk backwards.
-          var merged = blankUsage();
-          for (var k in merged) merged[k] = Math.max(known[k], normalized[k]);
-          s.auth.set(agentId, merged);
-        }
+        if (total) mergeAuthUsage(s, agentId, normalizeUsage(total));
         if (p.phase && typeof p.phase.kind === 'string' && p.phase.kind) {
           s.phase = p.phase.kind;
           s.running = s.phase === 'running' || s.phase === 'tool_call' || s.phase === 'retrying';
@@ -334,7 +483,6 @@
     if (!s) return out;
 
     var usage = blankUsage();
-    var steps = 0;
     var streamMs = 0;
     var ttftMs = 0;
     var ttftCount = 0;
@@ -346,11 +494,16 @@
     });
 
     var lastPromptTokens = 0;
+    var liveSteps = 0;
     s.steps.forEach(function (entry) {
       if (sawMain && entry.agentId !== MAIN_AGENT) return;
       addUsage(usage, entry.usage);
-      steps++;
-      // The prompt a step reports is the context size at that moment, so the
+      // Steps the transcript snapshot already listed are counted from
+      // histSteps; only steps new since the snapshot extend it — while their
+      // usage always counts, because the snapshot carries none.
+      var key = stepKey(entry.turnId, entry.ordinal);
+      if (!key || !s.histSteps.has(key)) liveSteps++;
+      // The prompt a step reported is the context size at that moment, so the
       // most recent step is the closest thing to current context occupancy —
       // the wire has no explicit "context used" field of its own.
       var prompt = entry.usage.inputOther + entry.usage.cacheRead + entry.usage.cacheCreate;
@@ -381,12 +534,12 @@
         cacheCreate: auth.cacheCreate
       };
       out.source = 'server';
-    } else if (steps > 0) {
+    } else if (liveSteps > 0) {
       out.source = 'stream';
     }
 
-    out.turns = s.turns.size;
-    out.steps = steps;
+    out.turns = Math.max(s.turns.size, s.histTurns.size, s.seedTurns || 0);
+    out.steps = s.histSteps.size + liveSteps;
     out.inputOther = usage.inputOther;
     out.output = usage.output;
     out.cacheRead = usage.cacheRead;
@@ -402,7 +555,7 @@
     out.contextMax = s.contextMax;
     out.hasContext = s.contextMax > 0;
     out.contextPct = out.hasContext
-      ? Math.min(100, Math.max(0, Math.round((s.contextTokens / s.contextMax) * 100)))
+      ? Math.min(100, Math.max(0, Math.round((out.contextTokens / out.contextMax) * 100)))
       : 0;
     out.model = s.model;
     out.running = s.running;
@@ -432,6 +585,10 @@
   var CORE = {
     createStore: createStore,
     applyFrame: applyFrame,
+    // Parsing entry point for the REST responses the renderer observes
+    // (GET /sessions/<id>/status | /transcript), exposed for tests.
+    applyRestPayload: applyRestPayload,
+    applySessionStatus: applySessionStatus,
     derive: derive,
     formatTokens: formatTokens,
     formatPct: formatPct,
@@ -490,7 +647,10 @@
         construct: function (target, args) {
           var ws = Reflect.construct(target, args);
           try {
-            if (String(args[0]).indexOf(WS_MARK) !== -1) observe(ws);
+            if (String(args[0]).indexOf(WS_MARK) !== -1) {
+              captureSocketOrigin(args[0]);
+              observe(ws);
+            }
           } catch (e) {
             /* never break the app's own socket */
           }
@@ -503,9 +663,64 @@
 
     try {
       window.WebSocket = proxy;
+      // surfaced for diagnostics (doctor.sh / CDP probes)
+      window.__kimiStatsWsHooked = true;
     } catch (e) {
       /* ignore */
     }
+  }
+
+  // Where the embedded server lives. The desktop shell records it for the app
+  // (sessionStorage), and the app's own socket URL falls back to the same host.
+  var socketOrigin = '';
+
+  function captureSocketOrigin(url) {
+    if (socketOrigin) return;
+    var host = /^wss?:\/\/([^/]+)/.exec(String(url));
+    if (host) socketOrigin = 'http://' + host[1];
+  }
+
+  function serverOrigin() {
+    try {
+      var recorded = sessionStorage.getItem('kimi-desktop-server-origin');
+      if (recorded) return String(recorded).replace(/\/+$/, '');
+    } catch (e) {
+      /* private mode or blocked storage */
+    }
+    return socketOrigin;
+  }
+
+  var SNAPSHOT_RETRY_MS = 60000;
+
+  // GET /sessions/<id>/snapshot is the only place a reopened session's
+  // cumulative usage lives (`session.usage`), and the app itself never asks for
+  // it. The embedded server treats loopback requests as trusted — the app sends
+  // no credentials on this route either — so we read it ourselves, once per
+  // session, never in a loop.
+  function ensureServerUsage(s) {
+    if (!s || !nativeFetch) return;
+    if (s.auth.has(MAIN_AGENT)) return;
+    var origin = serverOrigin();
+    if (!origin) return;
+    var now = Date.now();
+    if (s.snapshotTriedAt && now - s.snapshotTriedAt < SNAPSHOT_RETRY_MS) return;
+    s.snapshotTriedAt = now;
+
+    nativeFetch(origin + '/api/v1/sessions/' + encodeURIComponent(s.id) + '/snapshot', {
+      credentials: 'omit'
+    }).then(
+      function (res) {
+        return res && res.ok ? res.json() : null;
+      },
+      function () {
+        return null;
+      }
+    ).then(function (json) {
+      var data = json && json.data ? json.data : json;
+      if (data && applySnapshotPayload(s, data)) scheduleRender();
+    }).catch(function () {
+      /* the retry window above governs the next attempt */
+    });
   }
 
   function observe(ws) {
@@ -519,6 +734,100 @@
       }
       if (applyFrame(store, frame)) scheduleRender();
     });
+  }
+
+  // A session opened long after its last turn gets no usage frames at all, so
+  // the live socket alone can never fill the bar. The app itself asks the
+  // server for that session's state over HTTP — GET /sessions/<id>/snapshot
+  // (session + cumulative usage), /status (model + context meter) and
+  // /transcript (turn/step inventory). Observing those responses costs the app
+  // nothing and needs no credentials of our own: we just read a clone of what
+  // it already received.
+  var REST_MARK = /\/sessions\/([^/?#]+)\/(snapshot|status|transcript)\b/;
+  var fetchHooked = false;
+  var nativeFetch = null;
+
+  function hookFetch() {
+    if (fetchHooked || typeof window.fetch !== 'function') return;
+    fetchHooked = true;
+    var Native = window.fetch;
+    nativeFetch = Native; // kept untouched for our own snapshot read
+    try {
+      window.fetch = new Proxy(Native, {
+        apply: function (target, thisArg, args) {
+          var promise = Reflect.apply(target, thisArg, args);
+          try {
+            inspectRequest(args, promise);
+          } catch (e) {
+            /* never interfere with the app's own request */
+          }
+          return promise;
+        }
+      });
+    } catch (e) {
+      /* no Proxy support: leave fetch alone */
+    }
+  }
+
+  function requestUrl(args) {
+    var first = args && args[0];
+    if (typeof first === 'string') return first;
+    if (first && typeof first.url === 'string') return first.url;
+    return '';
+  }
+
+  function inspectRequest(args, promise) {
+    if (!promise || typeof promise.then !== 'function') return;
+    var match = REST_MARK.exec(requestUrl(args));
+    if (!match) return;
+    var sessionId = match[1];
+    var kind = match[2];
+    try {
+      sessionId = decodeURIComponent(sessionId);
+    } catch (e) {
+      /* keep the raw path segment */
+    }
+    promise.then(function (res) {
+      if (!res || typeof res.clone !== 'function' || res.ok === false) return;
+      var body;
+      try {
+        body = res.clone().json(); // throws once the app has consumed the body
+      } catch (e) {
+        return;
+      }
+      body.then(
+        function (json) {
+          if (applyRestPayload(store, sessionId, kind, json)) scheduleRender();
+        },
+        function () {
+          /* not JSON, or the request was cancelled */
+        }
+      );
+    }, function () {
+      /* the app's own failure */
+    });
+  }
+
+  function applyRestPayload(store, sessionId, kind, json) {
+    if (!sessionId) return false;
+    // the server wraps success payloads in {code, msg, data}
+    var data = json && json.data ? json.data : json;
+    if (!data || typeof data !== 'object') return false;
+    var s = sessionOf(store, sessionId);
+    var touched = false;
+    if (kind === 'status') {
+      touched = applySessionStatus(s, data);
+    } else if (kind === 'snapshot') {
+      touched = applySnapshotPayload(s, data);
+    } else {
+      // subagents have their own transcript; it must not overwrite the main
+      // inventory this bar reports on
+      if (typeof data.agent_id === 'string' && data.agent_id !== MAIN_AGENT) return false;
+      if (Array.isArray(data.items)) touched = applySnapshotItems(s, data.items);
+      if (data.meta) touched = applyAgentMeta(s, data.meta.agent) || touched;
+    }
+    if (touched) s.updatedAt = Date.now();
+    return touched;
   }
 
   // ============================================================== browser: ui
@@ -539,7 +848,7 @@
       popTitle: 'Token 用量',
       running: '进行中',
       idle: '空闲',
-      dTotal: '总量',
+      dTotal: '总量（不含缓存读取）',
       dInput: '未缓存输入',
       dCacheRead: '缓存读取',
       dCacheWrite: '缓存写入',
@@ -554,7 +863,7 @@
       dSource: '数据来源',
       srcServer: '服务端累计',
       srcStream: '事件流累计',
-      srcNone: '暂无',
+      srcNone: '仅快照（无 token 数据）',
       tipGauge: '本会话的轮次、步数与输出速度',
       tipTokens: '累计 token 用量与缓存命中率',
       tipContext: '上下文占用'
@@ -568,7 +877,7 @@
       popTitle: 'Token usage',
       running: 'running',
       idle: 'idle',
-      dTotal: 'Total',
+      dTotal: 'Total (excl. cache read)',
       dInput: 'Uncached input',
       dCacheRead: 'Cache read',
       dCacheWrite: 'Cache write',
@@ -583,7 +892,7 @@
       dSource: 'Source',
       srcServer: 'server totals',
       srcStream: 'event stream',
-      srcNone: 'none',
+      srcNone: 'snapshot only (no usage)',
       tipGauge: 'Turns, steps and output speed of this session',
       tipTokens: 'Cumulative token usage and cache hit rate',
       tipContext: 'Context occupancy'
@@ -591,38 +900,78 @@
   }[LANG];
 
   var CSS = [
-    '.ks-bar{display:flex;align-items:center;gap:6px;position:relative;z-index:2;',
-    'margin:2px 0 0 2px;padding:0;user-select:none;',
-    'font-family:var(--font-ui,system-ui);font-size:var(--ui-font-size-xs,12px);',
-    'line-height:var(--leading-caption,1.4);color:var(--color-text-muted,rgba(0,0,0,.6))}',
-    '.ks-pill{display:inline-flex;align-items:center;gap:6px;padding:2px 8px;border:0;',
-    'border-radius:var(--radius-dock-pill,10px);background:var(--color-hover,rgba(0,0,0,.03));',
-    'color:inherit;font:inherit;cursor:pointer;white-space:nowrap}',
-    '.ks-pill:hover{background:var(--color-selected,rgba(0,0,0,.06))}',
-    '.ks-dot{width:6px;height:6px;border-radius:50%;background:var(--color-text-quaternary,rgba(0,0,0,.3));flex:none}',
-    '.ks-gauge.ks-running .ks-dot{background:var(--color-success,#0e7a38);animation:ks-breathe 1.6s ease-in-out infinite}',
-    '@keyframes ks-breathe{0%,100%{opacity:1;transform:scale(1)}50%{opacity:.35;transform:scale(.75)}}',
-    '.ks-ring{display:inline-flex;align-items:center;gap:4px;padding:2px 7px 2px 3px;border:0;background:transparent;',
-    'color:inherit;font:inherit;cursor:pointer;border-radius:var(--radius-full,999px)}',
-    '.ks-ring:hover{background:var(--color-hover,rgba(0,0,0,.03))}',
-    '.ks-ring svg{width:14px;height:14px;flex:none;transform:rotate(-90deg)}',
-    '.ks-ring-track{stroke:var(--line,rgba(0,0,0,.13))}',
-    '.ks-ring-fill{stroke:var(--color-accent,#1783ff);transition:stroke-dashoffset .3s ease}',
+    // Same skin as the ZCode build (official DeepSeek Harness stats row):
+    // 999px pills, hairline border, soft shadow, blurred translucent surface,
+    // 11.5px tabular numerals, 14px outline icons.
+    '.ks-bar{display:flex;align-items:center;gap:8px;position:relative;z-index:2;',
+    'margin:2px 0 0 2px;padding:0;white-space:nowrap;user-select:none;-webkit-user-select:none;',
+    'font-family:var(--font-ui,system-ui);font-size:11.5px;line-height:16px;letter-spacing:.01em;',
+    'font-variant-numeric:tabular-nums;color:var(--color-text-muted,rgba(0,0,0,.6))}',
+    '.ks-pill{display:inline-flex;align-items:center;gap:6px;padding:5px 12px;border-radius:999px;',
+    'background:color-mix(in srgb,var(--color-surface,#fff) 82%,transparent);',
+    'backdrop-filter:blur(10px);-webkit-backdrop-filter:blur(10px);',
+    'border:1px solid var(--color-line,rgba(0,0,0,.13));box-shadow:0 6px 24px rgba(0,0,0,.08);',
+    'color:inherit;font:inherit;cursor:pointer;min-width:0;white-space:nowrap}',
+    '.ks-pill:hover{border-color:var(--color-text-faint,rgba(0,0,0,.45))}',
+    '.ks-pill:hover .ks-pill-text{color:var(--color-text,rgba(0,0,0,.9))}',
+    '.ks-pill-icon{display:inline-flex;color:var(--color-text-faint,rgba(0,0,0,.45));flex:none}',
+    '.ks-pill-text{overflow:hidden;text-overflow:ellipsis}',
+    '.ks-dot{width:7px;height:7px;border-radius:9999px;background:transparent;',
+    'border:1.5px solid var(--color-line,rgba(0,0,0,.13));flex:none}',
+    '.ks-gauge.ks-running .ks-dot{border-color:transparent;background:var(--color-success,#0e7a38);',
+    'animation:ks-breathe 1.6s ease-in-out infinite}',
+    '.ks-bar.ks-wait .ks-dot{border-color:transparent;background:var(--color-text-faint,rgba(0,0,0,.45));',
+    'animation:ks-breathe 1.2s ease-in-out infinite}',
+    '@keyframes ks-breathe{0%,100%{opacity:1}50%{opacity:.35}}',
+    '@media (prefers-reduced-motion:reduce){.ks-dot{animation:none!important}}',
+    // Context ring: official ContextMeter geometry (14px viewBox, r5.5, 2px, -90°)
+    '.ks-ring .ks-pill-icon{color:var(--color-text-muted,rgba(0,0,0,.6))}',
+    '.ks-ring svg{display:block}',
+    '.ks-ring-track{fill:none;stroke:var(--color-line,rgba(0,0,0,.13));stroke-width:2}',
+    '.ks-ring-fill{fill:none;stroke:currentColor;stroke-width:2;stroke-linecap:round}',
     '.ks-pop{position:fixed;z-index:300;min-width:250px;padding:10px 12px;border-radius:12px;',
-    'border:1px solid var(--color-line,rgba(0,0,0,.13));background:var(--color-menu-bg,rgba(255,255,255,.95));',
-    'backdrop-filter:var(--p-menu-backdrop,blur(24px) saturate(1.8));',
+    'border:1px solid var(--color-line,rgba(0,0,0,.13));background:var(--color-surface-overlay,rgba(255,255,255,.95));',
+    'backdrop-filter:blur(24px) saturate(1.8);-webkit-backdrop-filter:blur(24px) saturate(1.8);',
     'box-shadow:0 10px 28px -8px rgba(0,0,0,.28);color:var(--color-text,rgba(0,0,0,.9));',
     'font-family:var(--font-ui,system-ui);font-size:var(--ui-font-size-xs,12px)}',
     '.ks-pop-head{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-bottom:8px;',
     'color:var(--color-text,rgba(0,0,0,.9));font-weight:var(--weight-medium,500)}',
-    '.ks-pop-state{display:inline-flex;align-items:center;gap:4px;color:var(--muted,rgba(0,0,0,.45));font-weight:400}',
+    '.ks-pop-state{display:inline-flex;align-items:center;gap:4px;color:var(--color-text-muted,rgba(0,0,0,.45));font-weight:400}',
     '.ks-pop-state.ks-live::before{content:"";width:6px;height:6px;border-radius:50%;',
     'background:var(--color-success,#0e7a38);animation:ks-breathe 1.6s ease-in-out infinite}',
     '.ks-pop-list{display:grid;grid-template-columns:auto auto;gap:4px 16px;margin:0}',
-    '.ks-pop-list dt{color:var(--muted,rgba(0,0,0,.45))}',
+    '.ks-pop-list dt{color:var(--color-text-muted,rgba(0,0,0,.45))}',
     '.ks-pop-list dd{margin:0;text-align:right;font-family:var(--mono,ui-monospace,monospace);',
     'color:var(--color-text,rgba(0,0,0,.9))}'
   ].join('');
+
+  // Inline icons, same shapes as the ZCode build (official IconGaugeOutline16 /
+  // IconDatabaseOutline16); currentColor keeps them themed.
+  var ICON_GAUGE =
+    '<svg viewBox="0 0 16 16" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.3" aria-hidden="true">' +
+    '<path d="M2.7 10a5.5 5.5 0 1 1 10.6 0" stroke-linecap="round"/>' +
+    '<path d="M8 9.7 10.6 6.9" stroke-linecap="round"/>' +
+    '<circle cx="8" cy="9.9" r="1.1" fill="currentColor" stroke="none"/></svg>';
+  var ICON_DB =
+    '<svg viewBox="0 0 16 16" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.3" aria-hidden="true">' +
+    '<ellipse cx="8" cy="3.8" rx="5.3" ry="2.1"/>' +
+    '<path d="M2.7 3.8v8.4c0 1.16 2.37 2.1 5.3 2.1s5.3-.94 5.3-2.1V3.8"/>' +
+    '<path d="M2.7 8c0 1.16 2.37 2.1 5.3 2.1s5.3-.94 5.3-2.1"/></svg>';
+
+  // Official ContextMeter geometry: 14px viewBox, r=5.5, 2px stroke.
+  var RING_R = 5.5;
+  var RING_C = 2 * Math.PI * RING_R;
+
+  function ringSvg(percent) {
+    var pct = typeof percent === 'number' && isFinite(percent) ? Math.max(0, Math.min(100, percent)) : 0;
+    var arc = (RING_C * pct) / 100;
+    return (
+      '<svg viewBox="0 0 14 14" width="14" height="14" aria-hidden="true">' +
+      '<circle class="ks-ring-track" cx="7" cy="7" r="' + RING_R + '"/>' +
+      '<circle class="ks-ring-fill" cx="7" cy="7" r="' + RING_R + '" ' +
+      'stroke-dasharray="' + arc + ' ' + RING_C + '" transform="rotate(-90 7 7)"/></svg>'
+    );
+  }
 
   var barEl = null;
   var hostEl = null;
@@ -685,6 +1034,14 @@
     return el;
   }
 
+  function iconSpan(html) {
+    var span = node('span', 'ks-pill-icon');
+    span.innerHTML = html;
+    return span;
+  }
+
+  // Every element is the same pill shell (leading icon + text) sharing one
+  // skin; the context ring is the third pill, exactly like the ZCode build.
   function buildBar() {
     var bar = node('div', 'ks-bar');
     bar.id = BAR_ID;
@@ -693,21 +1050,19 @@
     gauge.type = 'button';
     gauge.title = T.tipGauge;
     gauge.appendChild(node('i', 'ks-dot'));
+    gauge.appendChild(iconSpan(ICON_GAUGE));
     gauge.appendChild(node('span', 'ks-gauge-text'));
 
     var tokens = node('button', 'ks-pill ks-tokens');
     tokens.type = 'button';
     tokens.title = T.tipTokens;
+    tokens.appendChild(iconSpan(ICON_DB));
     tokens.appendChild(node('span', 'ks-tokens-text'));
 
-    var ring = node('button', 'ks-ring');
+    var ring = node('button', 'ks-pill ks-ring');
     ring.type = 'button';
     ring.title = T.tipContext;
-    ring.innerHTML =
-      '<svg viewBox="0 0 20 20" aria-hidden="true">' +
-      '<circle class="ks-ring-track" cx="10" cy="10" r="7" fill="none" stroke-width="2.5"/>' +
-      '<circle class="ks-ring-fill" cx="10" cy="10" r="7" fill="none" stroke-width="2.5" stroke-linecap="round"/>' +
-      '</svg>';
+    ring.appendChild(iconSpan(ringSvg(0)));
     ring.appendChild(node('span', 'ks-ring-label'));
 
     bar.appendChild(gauge);
@@ -761,20 +1116,32 @@
     if (renderQueued) return;
     renderQueued = true;
     var run = function () {
+      if (!renderQueued) return;
       renderQueued = false;
       render();
     };
-    if (typeof requestAnimationFrame === 'function') requestAnimationFrame(run);
-    else setTimeout(run, 16);
+    // rAF coalesces bursts nicely but can stall in an occluded window, so race
+    // it with a timer; whichever fires first wins.
+    if (typeof requestAnimationFrame === 'function' && !document.hidden) {
+      requestAnimationFrame(run);
+      setTimeout(run, 120);
+    } else {
+      setTimeout(run, 16);
+    }
   }
 
   function render() {
-    if (!barEl || !document.contains(barEl)) {
+    if (!barEl || !document.contains(barEl) || !visible(barEl)) {
+      // Not attached, or attached to a composer that is no longer the visible
+      // one (side chat, panel teleport, settings overlay): re-target and bail
+      // out if there is no visible composer to hang off.
       if (!mount()) return;
+      if (!visible(barEl)) return;
     }
-    if (!visible(barEl)) return;
 
-    var m = derive(activeSession());
+    var session = activeSession();
+    if (session) ensureServerUsage(session);
+    var m = derive(session);
     lastMetrics = m;
 
     var gauge = barEl.querySelector('.ks-gauge');
@@ -784,23 +1151,29 @@
 
     gauge.classList.toggle('ks-running', !!m.running);
 
-    if (m.steps === 0 && m.turns === 0 && m.total === 0) {
+    var gaugeParts = compact([
+      m.turns > 0 ? m.turns + ' ' + T.turns : null,
+      m.steps > 0 ? m.steps + ' ' + T.steps : null,
+      m.outputSpeed > 0 ? trim(m.outputSpeed) + ' tok/s' : null
+    ]);
+
+    if (!gaugeParts && m.total === 0 && !m.hasContext) {
+      barEl.classList.add('ks-wait');
       setText(gauge.querySelector('.ks-gauge-text'), T.waiting);
+      setDisplay(gauge, true);
       setDisplay(tokens, false);
       setDisplay(ring, false);
       if (popEl) fillPop(popEl, m);
       return;
     }
+    barEl.classList.remove('ks-wait');
 
-    setDisplay(tokens, true);
-    setText(
-      gauge.querySelector('.ks-gauge-text'),
-      compact([
-        m.turns + ' ' + T.turns,
-        m.steps + ' ' + T.steps,
-        m.outputSpeed > 0 ? trim(m.outputSpeed) + ' tok/s' : null
-      ])
-    );
+    // A freshly opened session reports its totals through the windowed
+    // transcript snapshot, which carries no turn list — so say "running"
+    // rather than pretending the session has zero turns and zero steps.
+    setText(gauge.querySelector('.ks-gauge-text'), gaugeParts || T.running);
+    setDisplay(gauge, !!(gaugeParts || m.running));
+    setDisplay(tokens, m.total > 0);
 
     setText(
       tokens.querySelector('.ks-tokens-text'),
@@ -809,10 +1182,8 @@
 
     if (m.hasContext) {
       setDisplay(ring, true);
-      var circumference = 2 * Math.PI * 7;
-      var fill = ring.querySelector('.ks-ring-fill');
-      setAttr(fill, 'stroke-dasharray', String(circumference));
-      setAttr(fill, 'stroke-dashoffset', String(circumference * (1 - m.contextPct / 100)));
+      var arc = (RING_C * Math.min(100, Math.max(0, m.contextPct))) / 100;
+      setAttr(ring.querySelector('.ks-ring-fill'), 'stroke-dasharray', arc + ' ' + RING_C);
       setText(ring.querySelector('.ks-ring-label'), m.contextPct + '%');
     } else {
       setDisplay(ring, false);
@@ -872,12 +1243,20 @@
     setText(state, m.running ? T.running : T.idle);
     state.classList.toggle('ks-live', !!m.running);
 
+    // A session known only from a transcript snapshot has a turn/step
+    // inventory but no usage at all — printing "0 tok" would read as "this
+    // session used nothing", so say nothing instead.
+    var hasUsage = m.source !== 'none';
+    var amount = function (v) {
+      return hasUsage ? formatTokens(v) : '—';
+    };
+
     var rows = [
-      [T.dTotal, formatTokens(m.total) + ' ' + T.tokens],
-      [T.dInput, formatTokens(m.inputOther)],
-      [T.dCacheRead, formatTokens(m.cacheRead)],
-      [T.dCacheWrite, formatTokens(m.cacheCreate)],
-      [T.dOutput, formatTokens(m.output)],
+      [T.dTotal, hasUsage ? formatTokens(m.total) + ' ' + T.tokens : '—'],
+      [T.dInput, amount(m.inputOther)],
+      [T.dCacheRead, amount(m.cacheRead)],
+      [T.dCacheWrite, amount(m.cacheCreate)],
+      [T.dOutput, amount(m.output)],
       [T.dCacheHit, m.cacheRead > 0 ? formatPct(m.cacheHit) : '—'],
       [T.dSpeed, m.outputSpeed > 0 ? trim(m.outputSpeed) + ' tok/s' : '—'],
       [T.dTtft, m.ttftAvg > 0 ? trim(m.ttftAvg / 1000) + ' s' : '—'],
@@ -889,8 +1268,8 @@
             ? formatTokens(m.contextTokens) + ' ' + T.tokens
             : '—'
       ],
-      [T.dTurns, String(m.turns)],
-      [T.dSteps, String(m.steps)],
+      [T.dTurns, m.turns > 0 ? String(m.turns) : '—'],
+      [T.dSteps, m.steps > 0 ? String(m.steps) : '—'],
       [T.dModel, m.model || '—'],
       [T.dSource, m.source === 'server' ? T.srcServer : m.source === 'stream' ? T.srcStream : T.srcNone]
     ];
@@ -931,6 +1310,10 @@
     // and do nothing at all when it did not, so our own writes can never feed
     // this observer back into a render loop.
     new MutationObserver(function () {
+      // Fast path: while our bar still hangs off a host that is still in the
+      // document there is nothing to do. This avoids touching layout on every
+      // streamed token, which the subtree observer would otherwise trigger.
+      if (barEl && hostEl && barEl.parentElement === hostEl && document.contains(barEl)) return;
       if (queued) return;
       queued = true;
       queueMicrotask(function () {
@@ -959,9 +1342,13 @@
   function start() {
     injectStyles();
     hookWebSocket();
+    hookFetch();
     watch();
     if (mount()) render();
-    setInterval(render, 1000);
+    setInterval(function () {
+      if (document.hidden) return; // nothing to repaint while the window is hidden
+      render();
+    }, 1000);
   }
 
   // Debug/verification handle.
@@ -974,9 +1361,11 @@
     unmount: unmount
   };
 
-  // Hook the socket immediately: the app's own module scripts run before
-  // DOMContentLoaded and may open their connection that early.
+  // Hook the socket and fetch immediately: the app's own module scripts run
+  // before DOMContentLoaded and may open their connection (or fetch session
+  // state) that early.
   hookWebSocket();
+  hookFetch();
 
   if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', start);
   else start();
