@@ -151,6 +151,33 @@ context window is read (also read-only) from ZCode's own model config:
 | Context | Used = the last completed main-turn request's `input_tokens` (incl. cache read); window = the model's `contextWindow`; the ring shows the rounded percentage |
 | In / Out | Cumulative tokens (input grows with turns — context is resent every step) |
 
+#### Performance footprint
+
+The daemon aggregates **on demand**. A `?session=` request (what the pills send every
+second) is always computed immediately — never cached, so counters cannot lag. Only the
+session-less path (`bin/cli.mjs`) is served from a short TTL cache
+(`ZC_STATS_CACHE_MS`, default 1s; the older `ZC_STATS_POLL_MS` still works). Nothing is
+computed in the background while nobody is reading.
+
+Two things keep each aggregation cheap (measured on a 253MB DB with ~10k `model_usage`
+rows):
+
+- **Session-scoped queries name the session index explicitly** (`INDEXED BY`). ZCode's DB
+  has no `ANALYZE` statistics, so SQLite would otherwise satisfy
+  `session_id=? AND query_source='main_turn'` through the `query_source` index — which
+  matches ~87% of the table — rebuilding a temp B-tree over the whole table on every
+  request, with cost growing linearly with your history (per statement: 0.42ms at 6k rows
+  → 12.5ms at 120k rows). The hint keeps it at 0.03–0.05ms. If ZCode ever renames or drops
+  that index, the query falls back to the unhinted form automatically — same numbers,
+  slower — and logs a line to `daemon.log`.
+- **One long-lived read-only connection with prepared statements** is reused instead of
+  opening a fresh connection per query (~1.8ms → ~0.36ms). It is re-opened whenever the DB
+  file itself is replaced (VACUUM INTO, restore from backup), so it cannot serve stale
+  data; commits made by a running ZCode are visible immediately.
+
+Net effect versus the previous unconditional 1s polling: idle ~2.1% → ~0% of one core,
+and ~2.5% → ~0.13% while the pills poll once per second.
+
 #### Architecture
 
 ```
@@ -272,6 +299,24 @@ ZCode 桌面版本来就把每次模型请求写进本地数据库
 | 总量 | 未缓存输入 + 缓存写 + 输出（数据库 pill 展示值；`inputTokens` 本身已含缓存读） |
 | 上下文 | 已用 = 最近一次已完成主轮请求的 `input_tokens`（含缓存读）；窗口 = 该模型的 `contextWindow`；圆环显示四舍五入后的百分比 |
 | 输入/输出 | 累计 token（输入随轮数增长是正常的——每步都重发上下文） |
+
+#### 性能开销
+
+daemon **按需聚合**。带 `?session=` 的请求（渲染端每秒发的那种）永远即时计算、不进缓存，
+所以计数不会滞后；只有不带 session 的路径（`bin/cli.mjs`）走短 TTL 缓存
+（`ZC_STATS_CACHE_MS`，默认 1s；旧名 `ZC_STATS_POLL_MS` 仍然生效）。没人读的时候不做任何计算。
+
+单次聚合之所以便宜（在 253MB、`model_usage` 约 1 万行的库上实测）：
+
+- **会话级查询显式指定会话索引**（`INDEXED BY`）。ZCode 的库没有 `ANALYZE` 统计，SQLite 原本会把
+  `session_id=? AND query_source='main_turn'` 交给 `query_source` 索引——而它命中全表约 87% 行——
+  于是每次都全表重建临时 B-TREE，成本还随历史线性增长（单条语句：6k 行 0.42ms → 120k 行 12.5ms）。
+  加提示后恒定 0.03–0.05ms。若 ZCode 哪天改名或删掉该索引，会自动回退到不带提示的写法——
+  数值不变、只是变慢，并在 `daemon.log` 里记一行。
+- **常驻一条只读连接 + 预编译语句**，不再每次查询新开连接（约 1.8ms → 0.36ms）。连接会在库文件
+  本身被替换（VACUUM INTO、还原备份）时自动重开，因此不会读到旧数据；ZCode 运行中的新提交立刻可见。
+
+与改动前「无条件每秒轮询」相比：空闲态 ~2.1% → ~0% 单核，渲染端每秒请求时 ~2.5% → ~0.13%。
 
 #### 架构
 

@@ -57,16 +57,98 @@ if (USE_NODE_SQLITE) {
 }
 
 // ---------- 查询核心（同步，node:sqlite）----------
+//
+// 两条性能约定（2026-09-22 实测：model_usage 约 1 万行、库 253MB）：
+//
+//   1. 会话级查询显式指定会话索引。ZCode 的库没有 ANALYZE 统计（无 sqlite_stat1），
+//      规划器会把 `session_id=? AND query_source='main_turn'` 这类条件交给 query_source
+//      索引——而 main_turn 占全表约 87% 行，等于每次都在全表上建临时 B-TREE，成本随
+//      历史线性增长（合成同构库实测：6k 行 0.42ms → 120k 行 12.5ms/条）。加提示后压回
+//      会话范围，恒定 0.03~0.05ms，结果集不变（双 daemon JSON 逐字节比对验证）。索引名
+//      归 ZCode 所有，缺失时 SQLite 对 INDEXED BY 会直接报错，故失败即永久回退到不带
+//      提示的 SQL——只损失性能，不影响数值。
+//   2. 只读连接与预编译语句常驻复用。每次新开连接约 1.8ms（含 WAL 重新校验），复用后
+//      约 0.36ms；连接失效（库被替换、检查点、锁）时关掉重开一次，仍失败则走上层快照兜底。
 
-function querySqlNode(dbPath, statements) {
-  const db = new DatabaseSync(`file:${dbPath}?mode=ro`, { readOnly: true });
+const SESSION_INDEX = "model_usage_session_turn_idx";
+const FROM_MODEL_USAGE_RE = /\bFROM\s+model_usage\b(?!\s+INDEXED\s+BY)/i;
+
+let sessionIndexHint = { active: true, reason: null };
+
+// 供 daemon 在日志里留痕：永久回退时值得知道（否则只能靠性能变化察觉）
+export function sessionIndexHintState() {
+  return { ...sessionIndexHint };
+}
+
+function applySessionHint(sql) {
+  if (!sessionIndexHint.active || !/session_id\s*=/.test(sql)) return sql;
+  return sql.replace(FROM_MODEL_USAGE_RE, (m) => `${m} INDEXED BY ${SESSION_INDEX}`);
+}
+
+const isMissingIndexError = (err) => /no such index|INDEXED BY/i.test(String(err?.message || err));
+
+let roConn = null; // { uri, db, stmts, fp }
+
+function closeRoConn() {
   try {
-    // ZCode 运行中会写库，Windows 上并发比 macOS 严格，读前先给足等待避免
-    // "database is locked"（daemon.log 已实际出现过）
-    db.exec("PRAGMA busy_timeout = 5000");
-    return statements.map((sql) => db.prepare(sql).all());
-  } finally {
-    db.close();
+    roConn?.db.close();
+  } catch {}
+  roConn = null;
+}
+
+// 常驻连接靠文件指纹失效：库被替换（VACUUM INTO / 还原备份）或就地重写时，握着旧 inode
+// 的连接会一直读到旧数据——必须重开。主库文件只在 checkpoint 时变动（本机实测约每 10 分钟
+// 一次），所以这项每请求一次的 statSync 成本可忽略；WAL 里的新提交由 SQLite 自己保证可见。
+function dbFingerprint(dbPath) {
+  try {
+    const st = fs.statSync(dbPath);
+    return `${st.dev}:${st.ino}:${st.size}:${st.mtimeMs}`;
+  } catch {
+    return null; // 查不到（文件消失等）→ 不复用，走重开
+  }
+}
+
+function getRoConn(dbPath) {
+  const uri = `file:${dbPath}?mode=ro`;
+  const fp = dbFingerprint(dbPath);
+  if (roConn && roConn.uri === uri && fp !== null && roConn.fp === fp) return roConn;
+  closeRoConn();
+  const db = new DatabaseSync(uri, { readOnly: true });
+  // ZCode 运行中会写库，Windows 上并发比 macOS 严格，读前先给足等待避免
+  // "database is locked"（daemon.log 已实际出现过）
+  db.exec("PRAGMA busy_timeout = 5000");
+  roConn = { uri, db, stmts: new Map(), fp: dbFingerprint(dbPath) };
+  return roConn;
+}
+
+function runStatements(conn, statements) {
+  return statements.map((sql) => {
+    let st = conn.stmts.get(sql);
+    if (!st) {
+      if (conn.stmts.size >= 64) conn.stmts.clear(); // 会话切换会带来全新 SQL 文本，别无限涨
+      st = conn.db.prepare(sql);
+      conn.stmts.set(sql, st);
+    }
+    return st.all();
+  });
+}
+
+// reuse=false 用于快照兜底（临时库文件，用完即删，不能进常驻缓存）
+function querySqlNode(dbPath, statements, reuse = true) {
+  if (!reuse) {
+    const db = new DatabaseSync(`file:${dbPath}?mode=ro`, { readOnly: true });
+    try {
+      db.exec("PRAGMA busy_timeout = 5000");
+      return statements.map((sql) => db.prepare(sql).all());
+    } finally {
+      db.close();
+    }
+  }
+  try {
+    return runStatements(getRoConn(dbPath), statements);
+  } catch {
+    closeRoConn(); // 常驻连接可能已失效 → 重开一次；仍失败交给上层的快照兜底
+    return runStatements(getRoConn(dbPath), statements);
   }
 }
 
@@ -86,7 +168,7 @@ async function snapshotDb(dbPath) {
   }
 }
 
-async function querySql(dbPath, statements) {
+async function querySqlRaw(dbPath, statements) {
   if (USE_NODE_SQLITE) {
     try {
       return querySqlNode(dbPath, statements);
@@ -95,7 +177,7 @@ async function querySql(dbPath, statements) {
       const snap = await snapshotDb(dbPath);
       if (!snap) throw err;
       try {
-        return querySqlNode(snap, statements);
+        return querySqlNode(snap, statements, false);
       } finally {
         fs.rmSync(path.dirname(snap), { recursive: true, force: true });
       }
@@ -123,6 +205,21 @@ async function querySql(dbPath, statements) {
     } finally {
       fs.rmSync(path.dirname(snap), { recursive: true, force: true });
     }
+  }
+}
+
+// 统一入口：先按会话索引提示跑，索引不存在则永久回退到原样 SQL 重试
+async function querySql(dbPath, statements) {
+  const hinted = statements.map(applySessionHint);
+  const hintApplied = hinted.some((sql, i) => sql !== statements[i]);
+  try {
+    return await querySqlRaw(dbPath, hinted);
+  } catch (err) {
+    if (hintApplied && isMissingIndexError(err)) {
+      sessionIndexHint = { active: false, reason: String(err?.message || err) };
+      return await querySqlRaw(dbPath, statements);
+    }
+    throw err;
   }
 }
 
@@ -188,8 +285,8 @@ function sqlQuote(s) {
   return String(s).replace(/'/g, "''");
 }
 
-// 会话解析结果短缓存：指针文件内容不变时 5s 内直接复用，
-// 把后台每秒轮询的 sqlite3 spawn 从 ~4-9 次降到 ~1 次
+// 会话解析结果短缓存：指针文件内容不变时 5s 内直接复用，避免每秒一次的
+// 请求都去重跑「最近会话」查询（渲染端带 ?session= 时不走这条路径）
 const resolveCache = new Map(); // key: dbPath\0pointerPath -> { raw, sessionId, ts }
 
 async function resolveSessionId(dbPath, pointerPath) {

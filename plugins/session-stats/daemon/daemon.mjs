@@ -1,14 +1,19 @@
 // daemon.mjs — 会话统计 HTTP 守护进程（127.0.0.1，仅供本机渲染器状态栏读取）
 //
 // 职责：
-//   1. 周期性从 db.sqlite 聚合当前会话统计（默认 1s）
-//   2. GET /v1/stats  返回 JSON（token 鉴权；CORS 只回显请求方 Origin，不给通配符）
+//   1. 按需从 db.sqlite 聚合会话统计：带 ?session= 即时计算（渲染端每秒请求走这条），
+//      不带则返回 TTL 缓存（CLI/第三方），没人读时不再空转聚合
+//   2. GET /v1/stats 返回 JSON（token 鉴权；CORS 只回显请求方 Origin，不给通配符）
 //   3. 常驻：随 ZCode 存活（ZCode 退出后自动退出），由 hook 兜底拉起
 //
 // 鉴权：token 存于 RUNTIME_DIR/daemon-token（0600，install.sh 生成；缺失时自动生成）。
 //       状态栏用 ?t= 传参（补丁时烘焙同一 token），CLI 用 x-zcstats-token 头传递；
 //       同时校验 Host 头防 DNS rebinding。浏览器里任意网页（无 token）一律 403。
 // 启动：node daemon.mjs  （PORT / DB_PATH / POINTER_PATH 可用环境变量覆盖）
+//
+// 开销（2026-09-22 实测）：原先无条件每秒聚合一次，即使没人读；线上 daemon 因此常驻
+// 占 ~2.9% 单核（其中约一半是没人读的后台刷新）。改为按需 + TTL 后：空闲 0%，渲染端
+// 每秒请求时约 1.3ms/次（≈0.13% 单核），且不再随会话历史增长。
 
 import http from "node:http";
 import crypto from "node:crypto";
@@ -18,7 +23,7 @@ import os from "node:os";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { fileURLToPath } from "node:url";
-import { computeSessionStats, DEFAULT_DB_PATH, DEFAULT_POINTER_PATH } from "../core/stats-core.mjs";
+import { computeSessionStats, sessionIndexHintState, DEFAULT_DB_PATH, DEFAULT_POINTER_PATH } from "../core/stats-core.mjs";
 
 const pExecFile2 = promisify(execFile);
 
@@ -29,6 +34,8 @@ const PORT = Number(process.env.ZC_STATS_PORT || 47771);
 const DB_PATH = process.env.ZC_STATS_DB || DEFAULT_DB_PATH;
 const POINTER_PATH = process.env.ZC_STATS_POINTER || DEFAULT_POINTER_PATH;
 const POLL_MS = Number(process.env.ZC_STATS_POLL_MS || 1000);
+// 无 session 请求（CLI/第三方）的结果缓存时长；旧名 ZC_STATS_POLL_MS 继续生效
+const CACHE_MS = Number(process.env.ZC_STATS_CACHE_MS || POLL_MS);
 const LOG = path.join(RUNTIME_DIR, "daemon.log");
 const TOKEN_FILE = path.join(RUNTIME_DIR, "daemon-token");
 // daemon 自身 pid 文件（install.sh/uninstall.sh 用它在重启/卸载时精确停掉本 daemon）
@@ -84,23 +91,68 @@ function writeCORS(req, res) {
 
 let cache = { available: false, reason: "warming-up", generatedAt: 0 };
 let dbMissingLogged = false;
+let resolving = null; // 无 session 路径的并发去重
+const explicitInflight = new Map(); // sessionId -> Promise，渲染端并发去重
 
-async function refresh() {
-  try {
-    if (!fs.existsSync(DB_PATH)) {
-      if (!dbMissingLogged) {
-        log("db not found:", DB_PATH);
-        dbMissingLogged = true;
+// 索引提示被永久回退时在日志里留痕（否则只能靠性能变化察觉）
+let lastHintActive = sessionIndexHintState().active;
+function noteHintState() {
+  const state = sessionIndexHintState();
+  if (state.active === lastHintActive) return;
+  lastHintActive = state.active;
+  log(
+    state.active
+      ? "session index hint active again"
+      : `session index hint disabled (${state.reason || "unknown"}) — 退回不带索引提示的查询，只影响性能`
+  );
+}
+
+// 不带 session：TTL 缓存（只有 CLI/第三方会读这条；渲染端永远带 ?session=）
+async function resolvedStats() {
+  if (Date.now() - cache.generatedAt < CACHE_MS) return cache;
+  if (resolving) return resolving;
+  resolving = (async () => {
+    try {
+      if (!fs.existsSync(DB_PATH)) {
+        if (!dbMissingLogged) {
+          log("db not found:", DB_PATH);
+          dbMissingLogged = true;
+        }
+        cache = { available: false, reason: "db-not-found", generatedAt: Date.now() };
+        return cache;
       }
-      cache = { available: false, reason: "db-not-found", generatedAt: Date.now() };
-      return;
+      dbMissingLogged = false;
+      cache = await computeSessionStats({ dbPath: DB_PATH, pointerPath: POINTER_PATH });
+      return cache;
+    } catch (err) {
+      log("refresh error:", err?.message || err);
+      cache = { available: false, reason: "query-error", error: String(err?.message || err), generatedAt: Date.now() };
+      return cache;
+    } finally {
+      resolving = null;
+      noteHintState();
     }
-    dbMissingLogged = false;
-    cache = await computeSessionStats({ dbPath: DB_PATH, pointerPath: POINTER_PATH });
-  } catch (err) {
-    log("refresh error:", err?.message || err);
-    cache = { available: false, reason: "query-error", error: String(err?.message || err), generatedAt: Date.now() };
-  }
+  })();
+  return resolving;
+}
+
+// 带 session：即时计算、不做 TTL 缓存（避免轮次进行中计数滞后），只合并同一会话的并发请求
+async function explicitStats(sessionId) {
+  const running = explicitInflight.get(sessionId);
+  if (running) return running;
+  const p = (async () => {
+    try {
+      return await computeSessionStats({ dbPath: DB_PATH, pointerPath: POINTER_PATH, sessionId });
+    } catch (err) {
+      log("explicit stats error:", err?.message || err);
+      return { available: false, reason: "query-error" };
+    } finally {
+      explicitInflight.delete(sessionId);
+      noteHintState();
+    }
+  })();
+  explicitInflight.set(sessionId, p);
+  return p;
 }
 
 const server = http.createServer(async (req, res) => {
@@ -148,20 +200,10 @@ const server = http.createServer(async (req, res) => {
     const wantSession = url.searchParams.get("session");
     if (wantSession && /^[\w:-]{1,200}$/.test(wantSession)) {
       // 显式会话（状态栏按当前窗口/标签的 taskId 查询）：即时计算
-      try {
-        const data = await computeSessionStats({
-          dbPath: DB_PATH,
-          pointerPath: POINTER_PATH,
-          sessionId: wantSession,
-        });
-        res.end(JSON.stringify(data));
-      } catch (err) {
-        log("explicit stats error:", err?.message || err);
-        res.end(JSON.stringify({ available: false, reason: "query-error" }));
-      }
+      res.end(JSON.stringify(await explicitStats(wantSession)));
       return;
     }
-    res.end(JSON.stringify(cache));
+    res.end(JSON.stringify(await resolvedStats()));
     return;
   }
   res.writeHead(404);
@@ -184,8 +226,9 @@ server.listen(PORT, "127.0.0.1", () => {
     fs.writeFileSync(DAEMON_PID_FILE, String(process.pid)); // 供 install/uninstall 定位本 daemon
   } catch {}
   ensureToken();
-  refresh();
-  setInterval(refresh, POLL_MS).unref();
+  // 预热一次：让首个不带 session 的 /v1/stats（CLI）不必等聚合。
+  // 之后不再周期刷新——没人读就不算（渲染端每秒请求自带 session，走即时计算）
+  resolvedStats().catch(() => {});
 });
 
 // ZCode 消失退出（常驻策略）
