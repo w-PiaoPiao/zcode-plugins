@@ -234,6 +234,50 @@ let lastViewKey;
 let failCount = 0;
 let dialog = null; // { root, kind, pill } —— 单槽位即互斥
 
+// ---------- DOM 写入守卫 ----------
+// 每秒 tick 一次，但绝大多数 tick 里数值没变。若无条件重写样式/文本，每次写入都会让
+// 样式或布局失效，下一次 tick 的 getBoundingClientRect 又要强制重排 —— 白白的每秒开销。
+// 下面这些小工具在写入前先与 DOM 现值比较，只写真正变化的部分：稳态下每秒零写入，
+// 像素结果与无条件写入完全一致（同值写入本就是 no-op）。
+
+const composerCache = { el: null }; // 输入框元素引用（React 重渲染会让它断开 → 重新查找）
+const textElCache = new Map(); // kind -> 文本节点
+const ringFillCache = new Map(); // kind -> 圆环进度节点
+
+function composerEl() {
+  if (composerCache.el && composerCache.el.isConnected) return composerCache.el;
+  composerCache.el = document.querySelector('[data-testid="v4-composer"]');
+  return composerCache.el;
+}
+
+function pillTextEl(kind) {
+  let el = textElCache.get(kind);
+  if (!el || !el.isConnected) {
+    el = pills[kind]?.querySelector(".zcstats-pill-text");
+    if (!el) return null;
+    textElCache.set(kind, el);
+  }
+  return el;
+}
+
+function ringFillEl(kind) {
+  let el = ringFillCache.get(kind);
+  if (!el || !el.isConnected) {
+    el = pills[kind]?.querySelector(".zcstats-ring-fill");
+    if (!el) return null;
+    ringFillCache.set(kind, el);
+  }
+  return el;
+}
+
+function setStyle(el, prop, value) {
+  if (el && el.style[prop] !== value) el.style[prop] = value;
+}
+
+function setClass(el, name, on) {
+  if (el && el.classList.contains(name) !== on) el.classList.toggle(name, on);
+}
+
 function fmtTokens(n) {
   if (n == null || isNaN(n)) return "—";
   if (n < 1000) return String(n);
@@ -301,6 +345,17 @@ function cacheHitDisplay(t) {
 // ---------- pill 构建 ----------
 
 function setPillClickable(el, clickable, label) {
+  const wantFlag = clickable ? "1" : null;
+  // label 省略时保持既有 aria-label（与旧行为一致：只在传入 label 时改写）
+  const wantLabel = label || null;
+  // 属性状态已是目标值 → 整块写入可跳过（不可点态的其余属性由本函数成对增删，
+  // 故「标记缺失」即可推出它们也不存在；aria-expanded 由 open/closeDialog 维护）
+  if (
+    el.getAttribute("data-zcstats-clickable") === wantFlag &&
+    (wantLabel == null || el.getAttribute("aria-label") === wantLabel)
+  ) {
+    return;
+  }
   if (clickable) {
     el.setAttribute("data-zcstats-clickable", "1");
     el.setAttribute("role", "button");
@@ -314,7 +369,7 @@ function setPillClickable(el, clickable, label) {
     el.removeAttribute("aria-haspopup");
     el.removeAttribute("aria-expanded");
   }
-  if (label) el.setAttribute("aria-label", label);
+  if (wantLabel) el.setAttribute("aria-label", wantLabel);
 }
 
 function buildPill(kind, withDot, icon) {
@@ -358,16 +413,16 @@ function buildBar() {
 }
 
 function setPillText(kind, text) {
-  const t = pills[kind]?.querySelector(".zcstats-pill-text");
-  if (t) t.textContent = text;
+  const t = pillTextEl(kind);
+  if (t && t.textContent !== text) t.textContent = text;
 }
 
 function setWaitState() {
   if (!bar) return;
-  bar.classList.add("zcstats-wait");
-  bar.classList.remove("zcstats-live");
-  pills.usage.style.display = "none";
-  pills.context.style.display = "none";
+  setClass(bar, "zcstats-wait", true);
+  setClass(bar, "zcstats-live", false);
+  setStyle(pills.usage, "display", "none");
+  setStyle(pills.context, "display", "none");
   setPillText("time", "会话统计 · 等待本地服务…");
   setPillClickable(pills.time, false, "统计守护进程尚未就绪，正在自动重试");
   closeDialog();
@@ -378,14 +433,15 @@ function updateContextPill(t) {
   const pill = pills.context;
   if (!pill) return;
   if (!hasContext(t)) {
-    pill.style.display = "none";
+    setStyle(pill, "display", "none");
     setPillClickable(pill, false, "上下文容量：暂无模型上下文窗口数据");
     return;
   }
-  pill.style.display = "";
+  setStyle(pill, "display", "");
   const p = t.contextPercent;
-  const fill = pill.querySelector(".zcstats-ring-fill");
-  if (fill) fill.setAttribute("stroke-dasharray", `${(RING_C * p) / 100} ${RING_C}`);
+  const fill = ringFillEl("context");
+  const dash = `${(RING_C * p) / 100} ${RING_C}`;
+  if (fill && fill.getAttribute("stroke-dasharray") !== dash) fill.setAttribute("stroke-dasharray", dash);
   setPillText("context", `${p}%`);
   setPillClickable(
     pill,
@@ -397,24 +453,26 @@ function updateContextPill(t) {
 function render(data) {
   if (!bar) return;
   lastData = data;
-  bar.classList.remove("zcstats-wait");
+  setClass(bar, "zcstats-wait", false);
   const t = data && data.available ? data.totals : null;
-  pills.usage.style.display = "";
+  setStyle(pills.usage, "display", "");
   // daemon 可达但无数据（空会话/新会话）：显示全 0，绝不隐藏
   if (!t) {
-    bar.classList.remove("zcstats-live");
+    setClass(bar, "zcstats-live", false);
     setPillText("time", "0 轮 0 步");
     setPillText("usage", "0 tok · 缓存命中 —");
     setPillClickable(pills.time, false, "会话统计：当前会话暂无统计数据");
     setPillClickable(pills.usage, false, "Token 用量：当前会话暂无统计数据");
     updateContextPill(null);
     syncOpenDialog();
-    bar.style.display = "";
+    setStyle(bar, "display", "");
     return;
   }
-  bar.classList.toggle("zcstats-live", !!data.live);
+  setClass(bar, "zcstats-live", !!data.live);
   if (data.live) {
-    bar.querySelector(".zcstats-dot").title = `进行中 · 已 ${fmtDur(Date.now() - data.live.since)}`;
+    // 悬停提示里的「已 Ns」需要随秒走动，故意不做去重
+    const dot = bar.querySelector(".zcstats-dot");
+    if (dot) dot.title = `进行中 · 已 ${fmtDur(Date.now() - data.live.since)}`;
   }
 
   const timeClickable = hasTiming(t);
@@ -436,7 +494,7 @@ function render(data) {
   );
   updateContextPill(t);
   syncOpenDialog();
-  bar.style.display = "";
+  setStyle(bar, "display", "");
 }
 
 // ---------- 统计弹层（对齐官方 stat-dialog：portal / 锚定 / 外点关闭 / 互斥）----------
@@ -497,8 +555,16 @@ function updateDialog() {
       rows.push(["缓存写入", `${fmtExact(t.cacheWriteTokens)} tok`]);
     }
   }
-  dialog.root.innerHTML =
-    `<div class="zcstats-dialog-head">${head}</div>` + dialogRows(rows);
+  setDialogHtml(`<div class="zcstats-dialog-head">${head}</div>` + dialogRows(rows));
+}
+
+// 弹层内容去重：每秒 tick 都会重算一遍，但内容多数时候没变；整段 innerHTML 重写会
+// 让弹层内的布局失效、并让随后的 placeDialog() 强制重排，白烧 CPU。
+function setDialogHtml(html) {
+  if (!dialog) return;
+  if (dialog.lastHtml === html) return;
+  dialog.lastHtml = html;
+  dialog.root.innerHTML = html;
 }
 
 // 「上下文容量」弹层：标题行「上下文已用 P%」+ 右侧「已用 / 窗口」紧凑读数 + 占用条。
@@ -514,9 +580,10 @@ function updateContextDialog(t) {
     (ok
       ? `<span class="zcstats-dialog-sum">${fmtTokens(t.contextTokens)} / ${fmtTokens(t.contextWindow)} tok</span>`
       : "");
-  dialog.root.innerHTML =
+  setDialogHtml(
     `<div class="zcstats-dialog-head">${head}</div>` +
-    `<div class="zcstats-dialog-meter"><div class="zcstats-dialog-meter-seg" style="width:${p}%"></div></div>`;
+      `<div class="zcstats-dialog-meter"><div class="zcstats-dialog-meter-seg" style="width:${p}%"></div></div>`
+  );
 }
 
 // 锚定 pill 上方 gap 8px，视口 12px 边距钳制；上方放不下时落下方
@@ -533,8 +600,8 @@ function placeDialog() {
   if (top + h > window.innerHeight - M) top = Math.max(M, window.innerHeight - M - h);
   let left = r.left + r.width / 2 - w / 2;
   left = Math.min(Math.max(M, left), window.innerWidth - M - w);
-  dialog.root.style.left = Math.round(left) + "px";
-  dialog.root.style.top = Math.round(top) + "px";
+  setStyle(dialog.root, "left", Math.round(left) + "px");
+  setStyle(dialog.root, "top", Math.round(top) + "px");
 }
 
 function openDialog(kind) {
@@ -654,7 +721,7 @@ function resolveViewState() {
   if (document.querySelector('[data-testid="settings-page"]')) return { visible: false, sessionId: null };
   if (document.querySelector('[data-root-workspace-surface="inert"]')) return { visible: false, sessionId: null };
 
-  const composer = document.querySelector('[data-testid="v4-composer"]');
+  const composer = composerEl();
   if (!composer || composer.offsetParent === null || composer.getBoundingClientRect().height === 0) {
     // 无 composer 或不可见（可能在其他视图/隐藏）→ 隐藏
     return { visible: false, sessionId: null };
@@ -674,10 +741,11 @@ function resolveViewState() {
 }
 
 // 给输入框下方腾出统计条空间：内联样式优先级最高、必定生效。
-// React 重渲染可能清掉非受控内联属性，因此每次 tick 幂等补设。
+// React 重渲染可能清掉非受控内联属性，因此每次 tick 幂等补设（读的是 DOM 现值，
+// 已一致就不写——避免每秒给输入框制造一次样式失效）。
 function ensureComposerSpace() {
   try {
-    const composer = document.querySelector('[data-testid="v4-composer"]');
+    const composer = composerEl();
     if (composer && composer.style.marginBottom !== "36px") {
       composer.style.marginBottom = "36px";
     }
@@ -692,24 +760,24 @@ function ensureComposerSpace() {
 function placeBar() {
   if (!bar) return;
   try {
-    const composer = document.querySelector('[data-testid="v4-composer"]');
+    const composer = composerEl();
     if (composer) {
       const r = composer.getBoundingClientRect();
       if (r.height > 0 && r.bottom > 0 && r.bottom <= window.innerHeight + 40) {
         const barH = bar.offsetHeight || 28;
         const spaceBelow = window.innerHeight - r.bottom; // 输入框底边之下的留白高度
-        bar.style.bottom = Math.max(4, Math.round(spaceBelow - barH - 2)) + "px";
+        setStyle(bar, "bottom", Math.max(4, Math.round(spaceBelow - barH - 2)) + "px");
         // 水平：与输入框中心对齐（而非窗口中心）
-        bar.style.left = Math.round(r.left + r.width / 2) + "px";
-        bar.style.transform = "translateX(-50%)";
+        setStyle(bar, "left", Math.round(r.left + r.width / 2) + "px");
+        setStyle(bar, "transform", "translateX(-50%)");
         return;
       }
     }
   } catch {}
   // 回退：窗口底部居中
-  bar.style.left = "50%";
-  bar.style.transform = "translateX(-50%)";
-  bar.style.bottom = "8px";
+  setStyle(bar, "left", "50%");
+  setStyle(bar, "transform", "translateX(-50%)");
+  setStyle(bar, "bottom", "8px");
 }
 
 // 不再跨会话沿用 lastSessionId 缓存：新建对话/无会话时用 DRAFT_SENTINEL 强制全 0
@@ -718,13 +786,13 @@ async function tick() {
     bar = buildBar();
     document.body.appendChild(bar);
     setWaitState();
-    bar.style.display = "";
+    setStyle(bar, "display", "");
   }
   if (document.hidden) return;
 
   const view = resolveViewState();
   if (!view.visible) {
-    bar.style.display = "none"; // 设置页/非聊天视图 → 隐藏
+    setStyle(bar, "display", "none"); // 设置页/非聊天视图 → 隐藏
     closeDialog();
     lastViewKey = undefined;
     return;
@@ -739,21 +807,34 @@ async function tick() {
   if (data) {
     failCount = 0;
     render(data);
-    bar.style.display = "";
   } else {
     failCount++;
     setWaitState();
-    bar.style.display = "";
   }
+  setStyle(bar, "display", "");
   reportDiag(view);
 }
 
-// 诊断上报（排障用）：把 renderer 内部状态发给 daemon 写日志，每 15s 一次
+// 诊断上报（排障用）：把 renderer 内部状态发给 daemon 写日志，每 15s 一次。
+// 默认关闭——它会遍历 composer 读 getComputedStyle/getBoundingClientRect，还会在
+// daemon.log 里堆积（实测 27 小时 752 行、其中 99% 是它）。排障时打开即可，无需重装：
+//   · 渲染器控制台：localStorage.setItem("zcstats:diag", "1")（删除该键即关闭）
+//   · 或注入前设 window.__zcstatsDiag = true
+function diagEnabled() {
+  try {
+    if (window.__zcstatsDiag === true) return true;
+    return localStorage.getItem("zcstats:diag") === "1";
+  } catch {
+    return false;
+  }
+}
+
 let lastDiagAt = 0;
 function reportDiag(view) {
   const now = Date.now();
   if (now - lastDiagAt < 15000) return;
   lastDiagAt = now;
+  if (!diagEnabled()) return;
   try {
     const composers = [...document.querySelectorAll('[data-testid="v4-composer"]')].map((el, i) => {
       const r = el.getBoundingClientRect();
@@ -818,7 +899,7 @@ function start() {
   bar = buildBar();
   document.body.appendChild(bar);
   setWaitState();
-  bar.style.display = "";
+  setStyle(bar, "display", "");
 
   // 弹层全局关闭：点击面板/触发器之外，或 Escape
   document.addEventListener(

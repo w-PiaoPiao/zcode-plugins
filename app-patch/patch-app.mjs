@@ -326,7 +326,8 @@ function cmdPatch(argv) {
     const indexEntry = indexDir?.files?.[INDEX_HTML_KEY];
     if (!indexEntry) throw new Error("out/renderer/index.html not found in asar");
     let html = readPayload(srcFd, dataStart, indexEntry).toString("utf8");
-    const tagRe = /<script type="module" src="\.\/assets\/session-stats-bar\.js"><\/script><!-- data-zcode-session-stats -->/g;
+    // 替换注入时连同行尾换行一起清掉：否则每次「刷新注入」都会在 </head> 前多留一个空行
+    const tagRe = /<script type="module" src="\.\/assets\/session-stats-bar\.js"><\/script><!-- data-zcode-session-stats -->\n?/g;
     html = html.replace(tagRe, "");
     if (!html.includes("</head>")) throw new Error("index.html has no </head>");
     html = html.replace("</head>", INJECT_TAG + "\n</head>");

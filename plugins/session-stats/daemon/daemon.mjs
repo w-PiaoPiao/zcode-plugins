@@ -36,6 +36,8 @@ const POINTER_PATH = process.env.ZC_STATS_POINTER || DEFAULT_POINTER_PATH;
 const POLL_MS = Number(process.env.ZC_STATS_POLL_MS || 1000);
 // 无 session 请求（CLI/第三方）的结果缓存时长；旧名 ZC_STATS_POLL_MS 继续生效
 const CACHE_MS = Number(process.env.ZC_STATS_CACHE_MS || POLL_MS);
+// 距最近一次渲染端请求多久之后才恢复「ZCode 是否还在跑」的进程探测
+const LIVENESS_IDLE_MS = Number(process.env.ZC_STATS_LIVENESS_IDLE_MS || 60_000);
 const LOG = path.join(RUNTIME_DIR, "daemon.log");
 const TOKEN_FILE = path.join(RUNTIME_DIR, "daemon-token");
 // daemon 自身 pid 文件（install.sh/uninstall.sh 用它在重启/卸载时精确停掉本 daemon）
@@ -91,6 +93,7 @@ function writeCORS(req, res) {
 
 let cache = { available: false, reason: "warming-up", generatedAt: 0 };
 let dbMissingLogged = false;
+let lastRequestAt = 0; // 最近一次带 token 的请求时刻（渲染端请求＝ZCode 存活的证据）
 let resolving = null; // 无 session 路径的并发去重
 const explicitInflight = new Map(); // sessionId -> Promise，渲染端并发去重
 
@@ -169,6 +172,7 @@ const server = http.createServer(async (req, res) => {
     res.end();
     return;
   }
+  lastRequestAt = Date.now(); // 走到这里说明过了 token 校验：是渲染端/CLI 在活动
   // 渲染端诊断上报（悬浮条排障用）：把 renderer 内部状态写入 daemon.log
   if (url.pathname === "/v1/diag" && req.method === "POST") {
     let body = "";
@@ -237,8 +241,16 @@ server.listen(PORT, "127.0.0.1", () => {
 //                   或直接认定 renderer 存在即 ZCode 在跑）
 //   Windows     —— tasklist 查 ZCode.exe
 // 找不到时连续累计 3 次（约 90s）才退出。检测工具缺失时保守常驻，不误判退出。
+//
+// 省一次 spawn：渲染端的每秒请求本身就是「ZCode 活着」的铁证，所以最近有请求时直接跳过
+// 探测（正常聊天时不再 spawn pgrep；实测每次 pgrep 约 10~20ms 墙钟）。请求停止后
+// （窗口隐藏/设置页/退出）再过 LIVENESS_IDLE_MS 恢复探测。
 let zcodeGoneChecks = 0;
 setInterval(async () => {
+  if (Date.now() - lastRequestAt < LIVENESS_IDLE_MS) {
+    zcodeGoneChecks = 0; // 有活跃请求 → 必然存活
+    return;
+  }
   try {
     const alive = await zcodeRunning();
     zcodeGoneChecks = alive ? 0 : zcodeGoneChecks + 1;

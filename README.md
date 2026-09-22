@@ -178,6 +178,23 @@ rows):
 Net effect versus the previous unconditional 1s polling: idle ~2.1% → ~0% of one core,
 and ~2.5% → ~0.13% while the pills poll once per second.
 
+Renderer side, the pills now only touch the DOM when a value actually changed. Every write
+to an inline style or a class invalidates style/layout, which made the next tick's
+`getBoundingClientRect()` pay for a full re-layout — so in the steady state (idle session,
+nothing moving) a tick does zero DOM writes and its layout reads are free. The re-assert of
+the composer's bottom margin and of the bar's position is still performed every tick (that
+is the safety net against React wiping inline styles) — it just doesn't rewrite identical
+values. Element lookups are cached and re-validated via `isConnected`, and the open dialog
+re-renders only when its content changed. None of this alters what you see: the rendered
+markup is identical to the previous version (verified by running both against the same
+DOM fixture).
+
+The 15s diagnostics POST is now **opt-in**. It exists for troubleshooting only, but it walked
+every composer with `getComputedStyle`/`getBoundingClientRect` and produced ~99% of
+`daemon.log`. Turn it on when needed — no reinstall required:
+`localStorage.setItem("zcstats:diag", "1")` in the renderer console (delete the key to turn
+it off), or set `window.__zcstatsDiag = true` before the script runs.
+
 #### Architecture
 
 ```
@@ -195,8 +212,9 @@ ZCode model config ◄─┴─ daemon.mjs ──HTTP 127.0.0.1:47771──► p
                                         (session id: DOM data-session-id, fiber taskId fallback)
 ```
 
-The pills also POST their view/positioning diagnostics to the daemon every 15s
-(written to `daemon.log`, for troubleshooting only).
+The pills can POST their view/positioning diagnostics to the daemon
+(written to `daemon.log`, for troubleshooting only) — off by default, enable with
+`localStorage.setItem("zcstats:diag", "1")` in the renderer console.
 
 #### Known limitations
 
@@ -208,8 +226,8 @@ The pills also POST their view/positioning diagnostics to the daemon every 15s
 - Right after ZCode launches, before the daemon is up, the gauge pill shows
   "session stats · waiting for local service…" and switches to real metrics
   automatically.
-- For troubleshooting: the pills POST their view/positioning state to the daemon
-  every 15s; check `~/.zcode/session-stats/daemon.log`.
+- For troubleshooting: enable the diagnostics POST (see above), reproduce, then check
+  `~/.zcode/session-stats/daemon.log`.
 
 ---
 
@@ -318,6 +336,18 @@ daemon **按需聚合**。带 `?session=` 的请求（渲染端每秒发的那�
 
 与改动前「无条件每秒轮询」相比：空闲态 ~2.1% → ~0% 单核，渲染端每秒请求时 ~2.5% → ~0.13%。
 
+渲染端同样只在数值真的变化时才动 DOM：写内联样式或 class 会让样式/布局失效，下一次 tick 的
+`getBoundingClientRect()` 就要为此付一次整层重排——所以稳态（会话空闲、界面不动）下每 tick
+是零 DOM 写入、布局读取也几乎免费。输入框下边距与统计条位置的幂等补设**仍然每秒执行**（这是
+对抗 React 清掉内联样式的安全网），只是不再重写同样的值；元素引用做了缓存并用 `isConnected`
+校验失效；打开中的弹层仅在内容变化时重绘。这些都不改变观感——渲染出的标记与上一版完全一致
+（用同一套 DOM 夹具跑新旧两版逐字节比对验证）。
+
+每 15s 的诊断上报改为**默认关闭**：它只服务排障，却要遍历每个 composer 读
+`getComputedStyle`/`getBoundingClientRect`，并占了 `daemon.log` 约 99% 的内容。需要时打开即可，
+无需重装：渲染器控制台执行 `localStorage.setItem("zcstats:diag", "1")`（删掉该键即关闭），
+或在脚本注入前设 `window.__zcstatsDiag = true`。
+
 #### 架构
 
 ```
@@ -335,7 +365,8 @@ ZCode 模型配置 ◄──只读─┴─ daemon.mjs ──HTTP 127.0.0.1:4777
                           （会话 id：DOM data-session-id 优先，React fiber taskId 兜底）
 ```
 
-渲染端每 15s 把视图/定位/圆环诊断 POST 给 daemon，写入 `daemon.log`（仅排障用）。
+渲染端可以把视图/定位/圆环诊断 POST 给 daemon，写入 `daemon.log`（仅排障用）：
+默认关闭，需要时在渲染器控制台执行 `localStorage.setItem("zcstats:diag", "1")` 打开。
 
 #### 已知限制
 
@@ -350,8 +381,8 @@ ZCode 模型配置 ◄──只读─┴─ daemon.mjs ──HTTP 127.0.0.1:4777
   两个 pill 照常显示——与官方 `contextOccupancy` 在无容量数据时不渲染一致。
 - 上下文弹层只画总量占用条：ZCode 数据库里没有「系统提示 / 工具 / 对话」的来源
   拆分，走官方在 `contextBreakdown` 缺席时的单色段降级路径。
-- 排障：渲染端每 15s 把视图/定位内部状态上报给 daemon，写在
-  `~/.zcode/session-stats/daemon.log`（含圆环的 shown/percent/used/window）。
+- 排障：先在渲染器控制台打开诊断上报（`localStorage.setItem("zcstats:diag", "1")`），
+  复现问题后查看 `~/.zcode/session-stats/daemon.log`（含圆环的 shown/percent/used/window）。
 
 ### Kimi Code 桌面版（`kimi-code/`）
 
