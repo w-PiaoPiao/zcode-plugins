@@ -88,7 +88,8 @@ Kimi Code.app/Contents/Resources/desktop-dist/
 | WS `transcript.reset` / `transcript.ops` | 与上面同构的清单（`payload.snapshot.items`），打开会话时由服务端推送 |
 | WS `turn.step.completed` | **usage**（`inputOther`/`output`/`inputCacheRead`/`inputCacheCreation`）、`llmStreamDurationMs`、`llmFirstTokenLatencyMs` |
 | WS `turn.started` / `turn.step.started` / `turn.ended`、`event.session.work_changed` | 轮次与运行状态（`busy`） |
-| WS `subagent.spawned` | 模型名（兜底；这条线上只有子代理帧带 `model`） |
+| WS `subagent.spawned` | 模型名（兜底；这条线上只有子代理帧带 `model`）与子代理 id |
+| WS `subagent.completed` | **该子代理自己的累计 usage**（按 `subagentId` 分账；会话累计不含子代理，见「口径」） |
 | WS `event.session.created` | 会话级 usage（含 `context_tokens` / `context_limit`，若服务端给出） |
 
 **两条容易踩空的事实**：
@@ -112,7 +113,12 @@ Kimi Code.app/Contents/Resources/desktop-dist/
   总数），打开后的实时帧按 `turnId:ordinal` 去重后追加，所以同一步不会重复计数。
 - **token 用量**：优先用 `/snapshot` 的服务端累计（详情里"数据来源"显示"服务端累计"）；
   没有任何用量数据时详情显示 `—`（而不是 0），统计条上隐藏用量 pill。
-- 子代理步骤不计入（会话里一旦出现主代理步骤，非 `main` 的步骤会被跳过）。
+- **子代理（Task/Explore 等）**：用量与耗时**计入**，轮/步**不计入**。服务端的
+  `session.usage` 只累计主代理（2026-09-29 实测：它与主代理各步 usage 之和逐字节相等），
+  子代理的份额来自 `subagent.completed` 帧自带的累计值（该子代理的服务端权威总数，
+  按 `subagentId` 分账；实时会话里子代理尚未完成时先按它们的步帧累加）。弹层里以
+  「其中子代理」一行标出该份额（已含在合计中，不重复相加）。
+  非 `main` 的步不会进入主代理的步数、上下文读数与首 token 口径。
 
 ## 自检与测试
 
@@ -152,7 +158,12 @@ sudo bash install.sh
 - **历史空闲会话**：轮数 / 步数 / 总量 / 缓存命中 / 上下文 / 模型都齐全（总量来自 `/snapshot`），
   但**输出速度和首 token 平均显示 `—`** —— 服务端不下发每步耗时（`llmStreamDurationMs` 只出现在
   实时帧里），拿 turn 的墙钟时长顶替会系统性偏低。会话一旦有新活动，这两项立即出现。
-- 统计条显示的是**主代理**口径；子代理自身消耗不计入。
+- 轮 / 步 / 上下文是**主代理**口径；token 总量与耗时**含子代理**（2026-09-29 起，
+  与 ZCode 版对齐）—— 子代理的份额在弹层里以「其中子代理」一行标出。
+- **历史会话拿不到子代理份额**：这份数据只有 `subagent.completed` 帧携带，而它只在子代理
+  结束时实时到达；`/snapshot` 的服务端累计与 `subagents` 列表都不含已结束子代理的用量
+  （2026-09-29 实测：`subagents` 为空、messages 无 usage）。所以重开一个旧会话时总量只有
+  主代理部分，弹层里不显示「其中子代理」行；会话一旦产生新的子代理就会补上。
 - 输入框工具条里本来就有一个 16px 的上下文圆环（应用自带，只显示环形）。统计条里的圆环
   是 DeepSeek Harness 同款样式、额外带百分比数字；如果觉得重复，可以删掉 `buildBar()` 里的
   ring 节点。

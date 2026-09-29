@@ -87,7 +87,7 @@ test('step events accumulate once per stepId', () => {
   assert.equal(m.source, 'stream');
 });
 
-test('subagents do not pollute a session that has main-agent steps', () => {
+test('subagent usage counts toward totals but not toward the main counters', () => {
   const store = CORE.createStore();
   const frame = (agentId, usage) => ({
     type: 'turn.step.completed',
@@ -95,11 +95,48 @@ test('subagents do not pollute a session that has main-agent steps', () => {
     payload: { agentId, turnId: 0, stepId: agentId + '-1', usage }
   });
   CORE.applyFrame(store, frame('main', { output: 100 }));
-  CORE.applyFrame(store, frame('agent-0', { output: 9999 }));
+  CORE.applyFrame(store, frame('agent-0', { output: 9999, inputOther: 1000 }));
 
   const m = CORE.derive(store.sessions.get('s1'));
+  // Turns and steps describe the main session only…
   assert.equal(m.steps, 1);
-  assert.equal(m.output, 100);
+  assert.equal(m.turns, 1);
+  // …while the token totals carry the whole conversation (main + sub-agent).
+  assert.equal(m.output, 100 + 9999);
+  assert.equal(m.inputOther, 1000);
+  assert.equal(m.total, 11099);
+  assert.ok(m.subagent, 'the sub-agent share is broken out');
+  assert.equal(m.subagent.sessions, 1);
+  assert.equal(m.subagent.total, 10999);
+});
+
+test('a completed subagent brings its own server tally, and it wins when larger', () => {
+  const store = CORE.createStore();
+  const step = (agentId, usage) => ({
+    type: 'turn.step.completed',
+    session_id: 's1',
+    payload: { agentId, turnId: 0, stepId: agentId + '-1', usage }
+  });
+  CORE.applyFrame(store, step('main', { output: 10 }));
+  CORE.applyFrame(store, step('agent-0', { output: 20 }));
+  // The frame's usage is the sub-agent's cumulative total (a windowed step
+  // list can miss trimmed history), so the larger of the two wins.
+  CORE.applyFrame(store, {
+    type: 'subagent.completed',
+    session_id: 's1',
+    payload: {
+      subagentId: 'agent-0',
+      usage: { inputOther: 500, output: 600, inputCacheRead: 700, inputCacheCreation: 0 }
+    }
+  });
+
+  const m = CORE.derive(store.sessions.get('s1'));
+  assert.equal(m.output, 10 + 600, 'the server tally replaces the step sum');
+  assert.equal(m.inputOther, 500);
+  assert.equal(m.cacheRead, 700);
+  assert.equal(m.subagent.sessions, 1);
+  assert.equal(m.subagent.total, 1100);
+  assert.equal(m.steps, 1, 'sub-agent steps never extend the main step count');
 });
 
 test('transcript snapshot rebuilds state and is not additive', () => {
@@ -619,7 +656,10 @@ test('replaying a real recorded session matches a reference sum', (t) => {
   const sessionId = best.frames[0].session_id;
   const m = CORE.derive(store.sessions.get(sessionId));
 
-  // Reference: a plain sum over the same frames, deduplicated by stepId.
+  // Reference: a plain sum over the same frames, deduplicated by stepId. The
+  // main-agent share drives turns/steps; the token totals also carry the
+  // sub-agent share, which is the sub-agent's own server tally
+  // (subagent.completed) or its step frames, whichever is larger.
   const seen = new Set();
   const ref = { inputOther: 0, output: 0, cacheRead: 0, cacheCreate: 0 };
   const turns = new Set();
@@ -635,19 +675,43 @@ test('replaying a real recorded session matches a reference sum', (t) => {
     ref.cacheRead += u.cacheRead;
     ref.cacheCreate += u.cacheCreate;
   }
+  const blank = () => ({ inputOther: 0, output: 0, cacheRead: 0, cacheCreate: 0 });
+  const addUsageTo = (acc, u) => {
+    acc.inputOther += u.inputOther;
+    acc.output += u.output;
+    acc.cacheRead += u.cacheRead;
+    acc.cacheCreate += u.cacheCreate;
+  };
+  const subFromCompleted = blank();
+  const subFromSteps = blank();
+  const subSeen = new Set();
+  for (const f of best.frames) {
+    const p = f.payload || {};
+    if (f.type === 'subagent.completed' && p.usage) addUsageTo(subFromCompleted, CORE.normalizeUsage(p.usage));
+    if (f.type !== 'turn.step.completed' || (p.agentId || 'main') === 'main') continue;
+    const key = p.stepId || `${p.turnId}:${p.step}`;
+    if (subSeen.has(key)) continue;
+    subSeen.add(key);
+    addUsageTo(subFromSteps, CORE.normalizeUsage(p.usage));
+  }
+  const weight = (u) => u.inputOther + u.output + u.cacheRead + u.cacheCreate;
+  const sub = weight(subFromCompleted) >= weight(subFromSteps) ? subFromCompleted : subFromSteps;
 
   assert.ok(applied > 0, 'at least one frame must be recognised');
-  assert.equal(m.steps, seen.size, 'step count matches the reference');
-  assert.equal(m.turns, turns.size, 'turn count matches the reference');
-  assert.equal(m.inputOther, ref.inputOther);
-  assert.equal(m.output, ref.output);
-  assert.equal(m.cacheRead, ref.cacheRead);
-  assert.equal(m.cacheCreate, ref.cacheCreate);
+  assert.equal(m.steps, seen.size, 'step count matches the main-agent reference');
+  assert.equal(m.turns, turns.size, 'turn count matches the main-agent reference');
+  assert.equal(m.inputOther, ref.inputOther + sub.inputOther);
+  assert.equal(m.output, ref.output + sub.output);
+  assert.equal(m.cacheRead, ref.cacheRead + sub.cacheRead);
+  assert.equal(m.cacheCreate, ref.cacheCreate + sub.cacheCreate);
+  assert.equal(!!m.subagent, weight(sub) > 0, 'the sub-agent share is broken out when present');
+  if (m.subagent) assert.equal(m.subagent.total, sub.inputOther + sub.cacheCreate + sub.output);
   assert.ok(m.outputSpeed > 0, 'output speed derived from real timings');
 
   console.log(
     `    replayed ${best.frames.length} frames from ${best.file.split('/').pop()}: ` +
-      `${m.turns} turns, ${m.steps} steps, ${CORE.formatTokens(m.total)} tok, ` +
-      `cache ${CORE.formatPct(m.cacheHit)}, ${m.outputSpeed.toFixed(1)} tok/s`
+      `${m.turns} turns, ${m.steps} steps, ${CORE.formatTokens(m.total)} tok` +
+      (m.subagent ? ` (subagents ${CORE.formatTokens(m.subagent.total)})` : '') +
+      `, cache ${CORE.formatPct(m.cacheHit)}, ${m.outputSpeed.toFixed(1)} tok/s`
   );
 });

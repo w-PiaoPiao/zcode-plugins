@@ -112,6 +112,11 @@
       histSteps: new Set(),
       // agentId -> cumulative usage as reported by the server (authoritative)
       auth: new Map(),
+      // Sub-agent ids seen on the wire. A sub-agent's server tally lands in
+      // `auth` under the same id (subagent.completed carries its own
+      // cumulative usage), so the totals can include it; this set only feeds
+      // the breakdown row and the sub-agent session count.
+      subagentIds: new Set(),
       // Lowest turn count the server has told us about (phase.turnId is a
       // per-session 0-based counter), for sessions whose turn list we never
       // receive — the transcript snapshot of an old session is windowed.
@@ -368,7 +373,9 @@
 
     switch (frame.type) {
       case 'turn.step.completed':
-        s.turns.add(p.turnId);
+        // Turn numbering is per agent; only the main agent's turns describe
+        // the session, so a sub-agent's ids must not inflate the count.
+        if (agentId === MAIN_AGENT) s.turns.add(p.turnId);
         upsertStep(s, p.stepId || p.turnId + ':' + p.step, {
           usage: normalizeUsage(p.usage),
           timing: pickTiming(p),
@@ -381,7 +388,7 @@
 
       case 'turn.step.started':
       case 'turn.started':
-        s.turns.add(p.turnId);
+        if (agentId === MAIN_AGENT) s.turns.add(p.turnId);
         s.running = true;
         touched = true;
         break;
@@ -412,11 +419,31 @@
         break;
       }
 
-      case 'subagent.spawned': {
+      case 'subagent.spawned':
+      case 'subagent.started': {
         // On this wire only subagent frames carry a model id; it is the model
         // the session actually runs on.
+        if (typeof p.subagentId === 'string' && p.subagentId) s.subagentIds.add(p.subagentId);
         if (typeof p.model === 'string' && p.model) s.model = p.model;
         touched = true;
+        break;
+      }
+
+      case 'subagent.completed': {
+        // Carries the sub-agent's own cumulative usage. The session's server
+        // tally (`session.usage`) covers the main agent only — verified
+        // against a real journal: it equals the main agent's step sums to the
+        // token — so this frame is the only place the sub-agent share shows
+        // up. mergeAuthUsage keys it by sub-agent id, keeping the two apart.
+        if (typeof p.subagentId === 'string' && p.subagentId) s.subagentIds.add(p.subagentId);
+        if (p.usage && typeof p.usage === 'object') {
+          mergeAuthUsage(
+            s,
+            typeof p.subagentId === 'string' && p.subagentId ? p.subagentId : 'subagent',
+            normalizeUsage(p.usage)
+          );
+          touched = true;
+        }
         break;
       }
 
@@ -478,7 +505,11 @@
       hasContext: false,
       model: '',
       running: false,
-      source: 'none'
+      source: 'none',
+      // Sub-agent share of the totals: { sessions, inputOther, output,
+      // cacheRead, cacheCreate, total } — already included in the figures
+      // above, broken out for the popover. null when there are none.
+      subagent: null
     };
     if (!s) return out;
 
@@ -495,9 +526,21 @@
 
     var lastPromptTokens = 0;
     var liveSteps = 0;
+    var subLocal = blankUsage();
     s.steps.forEach(function (entry) {
-      if (sawMain && entry.agentId !== MAIN_AGENT) return;
-      addUsage(usage, entry.usage);
+      var isSub = sawMain && entry.agentId !== MAIN_AGENT;
+      // A sub-agent's steps count toward tokens and timing — the whole
+      // conversation's cost — but never toward the main agent's step count
+      // or its context reading, which describe this session only.
+      addUsage(isSub ? subLocal : usage, entry.usage);
+      if (entry.timing) {
+        if (typeof entry.timing.llmStreamDurationMs === 'number') streamMs += entry.timing.llmStreamDurationMs;
+        if (typeof entry.timing.llmFirstTokenLatencyMs === 'number') {
+          ttftMs += entry.timing.llmFirstTokenLatencyMs;
+          ttftCount++;
+        }
+      }
+      if (isSub) return;
       // Steps the transcript snapshot already listed are counted from
       // histSteps; only steps new since the snapshot extend it — while their
       // usage always counts, because the snapshot carries none.
@@ -508,19 +551,12 @@
       // the wire has no explicit "context used" field of its own.
       var prompt = entry.usage.inputOther + entry.usage.cacheRead + entry.usage.cacheCreate;
       if (prompt > 0) lastPromptTokens = prompt;
-      if (entry.timing) {
-        if (typeof entry.timing.llmStreamDurationMs === 'number') streamMs += entry.timing.llmStreamDurationMs;
-        if (typeof entry.timing.llmFirstTokenLatencyMs === 'number') {
-          ttftMs += entry.timing.llmFirstTokenLatencyMs;
-          ttftCount++;
-        }
-      }
     });
 
     var auth = s.auth.get(MAIN_AGENT) || null;
     if (!auth) {
-      s.auth.forEach(function (v) {
-        if (fallbackAuth === null) fallbackAuth = v;
+      s.auth.forEach(function (v, id) {
+        if (fallbackAuth === null && !s.subagentIds.has(id)) fallbackAuth = v;
       });
       auth = sawMain ? null : fallbackAuth;
     }
@@ -538,19 +574,48 @@
       out.source = 'stream';
     }
 
+    // Sub-agent share. `session.usage` tallies the main agent only (verified
+    // against a real journal: it equals the main agent's step sums to the
+    // token), so this part is added on top: the server's per-sub-agent tally
+    // when subagent.completed/agent.status.updated has arrived, else what the
+    // live step frames already showed.
+    var subServer = blankUsage();
+    var subIds = new Set(s.subagentIds);
+    s.auth.forEach(function (v, id) {
+      if (id === MAIN_AGENT) return;
+      subIds.add(id);
+      addUsage(subServer, v);
+    });
+    // Agents seen only through their step frames still count as sessions.
+    s.steps.forEach(function (entry) {
+      if (sawMain && entry.agentId !== MAIN_AGENT) subIds.add(entry.agentId);
+    });
+    var subUsage = usageOf(subServer) > usageOf(subLocal) ? subServer : subLocal;
+
     out.turns = Math.max(s.turns.size, s.histTurns.size, s.seedTurns || 0);
     out.steps = s.histSteps.size + liveSteps;
-    out.inputOther = usage.inputOther;
-    out.output = usage.output;
-    out.cacheRead = usage.cacheRead;
-    out.cacheCreate = usage.cacheCreate;
+    out.inputOther = usage.inputOther + subUsage.inputOther;
+    out.output = usage.output + subUsage.output;
+    out.cacheRead = usage.cacheRead + subUsage.cacheRead;
+    out.cacheCreate = usage.cacheCreate + subUsage.cacheCreate;
     // Total excludes cache reads (the same definition the ZCode pills use);
     // the popover breaks every bucket out separately.
-    out.total = usage.inputOther + usage.cacheCreate + usage.output;
-    var promptTokens = usage.inputOther + usage.cacheRead + usage.cacheCreate;
-    out.cacheHit = promptTokens > 0 ? usage.cacheRead / promptTokens : 0;
-    out.outputSpeed = streamMs > 0 ? usage.output / (streamMs / 1000) : 0;
+    out.total = out.inputOther + out.cacheCreate + out.output;
+    var promptTokens = out.inputOther + out.cacheRead + out.cacheCreate;
+    out.cacheHit = promptTokens > 0 ? out.cacheRead / promptTokens : 0;
+    out.outputSpeed = streamMs > 0 ? out.output / (streamMs / 1000) : 0;
     out.ttftAvg = ttftCount > 0 ? ttftMs / ttftCount : 0;
+    out.subagent =
+      subIds.size > 0 || usageOf(subUsage) > 0
+        ? {
+            sessions: subIds.size,
+            inputOther: subUsage.inputOther,
+            output: subUsage.output,
+            cacheRead: subUsage.cacheRead,
+            cacheCreate: subUsage.cacheCreate,
+            total: subUsage.inputOther + subUsage.cacheCreate + subUsage.output
+          }
+        : null;
     out.contextTokens = s.contextTokens > 0 ? s.contextTokens : lastPromptTokens;
     out.contextMax = s.contextMax;
     out.hasContext = s.contextMax > 0;
@@ -853,6 +918,8 @@
       dCacheRead: '缓存读取',
       dCacheWrite: '缓存写入',
       dOutput: '输出',
+      dSubagent: '其中子代理',
+      subSessions: '个会话',
       dCacheHit: '缓存命中',
       dSpeed: '输出速度',
       dTtft: '首 token 平均',
@@ -882,6 +949,8 @@
       dCacheRead: 'Cache read',
       dCacheWrite: 'Cache write',
       dOutput: 'Output',
+      dSubagent: 'of which subagents',
+      subSessions: 'sessions',
       dCacheHit: 'Cache hit',
       dSpeed: 'Output speed',
       dTtft: 'First token avg',
@@ -1273,6 +1342,19 @@
       [T.dModel, m.model || '—'],
       [T.dSource, m.source === 'server' ? T.srcServer : m.source === 'stream' ? T.srcStream : T.srcNone]
     ];
+    // Sub-agent share, shown only when the session spawned any. The totals
+    // above already include it (`session.usage` covers the main agent only),
+    // so this row explains the number rather than adding to it.
+    if (m.subagent) {
+      rows.splice(5, 0, [
+        T.dSubagent,
+        m.subagent.sessions +
+          ' ' +
+          T.subSessions +
+          ' · ' +
+          (hasUsage ? formatTokens(m.subagent.total) + ' ' + T.tokens : '—')
+      ]);
+    }
 
     var list = pop.querySelector('.ks-pop-list');
     // Rebuilding the row list on every frame would be a lot of DOM churn for
