@@ -8,16 +8,22 @@
 //   tool_usage   每次工具调用一行
 //   session      会话元信息
 //
-// 口径（与 DeepSeek 对话框信息栏对齐，另加扩展项）：
-//   轮   = COUNT(DISTINCT parent_user_message_id)  —— 用户消息触发的轮
-//   步   = COUNT(DISTINCT logical_request_id)      —— 智能体循环里的模型请求步数
-//   LLM  = SUM(duration_ms)                        —— 纯模型耗时（含重试，不含工具执行）
+// 口径（消耗类按「会话树」聚合，进度/上下文类按主会话）：
+//   会话树 = 本会话 + 沿 session.parent_id 递归出的全部子代理会话。ZCode 把每个子代理
+//            （Task/Explore 等）记成独立会话（task_type='subagent_child'，model_usage
+//            里 query_source='subagent'），只按 session_id 聚合会完全漏掉它们——实测某
+//            对话子代理占真实消耗的 71%~92%，故 token/耗时/工具一律沿树求和。
+//   token（输入/输出/缓存读/缓存写）= 会话树内所有已完成请求之和 —— 回答"这个对话真实花了多少"
+//   LLM  = SUM(duration_ms)                        —— 纯模型耗时（含重试与子代理，不含工具执行）
 //   工具 = SUM(duration_ms where completed)        —— 工具调用用时（并行调用按时长求和，与官方折算一致）
+//   轮   = COUNT(DISTINCT parent_user_message_id)  —— 用户消息触发的轮（主会话；子代理没有用户轮）
+//   步   = COUNT(DISTINCT logical_request_id)      —— 主会话智能体循环里的模型请求步数
 //   首 token = 请求级 TTFT 均值（对齐 DeepSeek 官方「首 token 平均」口径）
 //   tok/s    = 总输出 / (总耗时 - 总 TTFT)
 //   缓存命中 = cache_read / (input + cache_write)  —— input 为含缓存读的总输入
 //   上下文   = 最近一次已完成主轮请求的 input_tokens（含缓存读）÷ 模型上下文窗口
 //              （窗口来自 ZCode 的模型配置，见 resolveContextWindow）
+//   子代理明细（totals.subagent）= 树内非本会话部分的独占值，供 UI 透明展示
 //
 // 所有查询走 node:sqlite（Node 22.5+ 内置），以只读模式打开，不影响运行中的 ZCode。
 // 跨平台：macOS/Linux/Windows 均无需外部 sqlite3（Windows 无系统 sqlite3，
@@ -81,7 +87,10 @@ export function sessionIndexHintState() {
 }
 
 function applySessionHint(sql) {
-  if (!sessionIndexHint.active || !/session_id\s*=/.test(sql)) return sql;
+  // 覆盖两种会话限定形态：`session_id=?`（主轮/最近请求）与 `session_id IN (…会话树…)`
+  // （树聚合）。两条都从会话索引起步，树聚合里没有 query_source 条件，规划器本就会
+  // 选对索引（实测带/不带提示均 0.05ms 级），加提示是防规划器随历史增长改主意的保险。
+  if (!sessionIndexHint.active || !/session_id\s*(?:=|IN\b)/i.test(sql)) return sql;
   return sql.replace(FROM_MODEL_USAGE_RE, (m) => `${m} INDEXED BY ${SESSION_INDEX}`);
 }
 
@@ -471,24 +480,22 @@ export async function computeSessionStats(opts = {}) {
   }
 
   const SID = sqlQuote(sessionId);
+  // 会话树 CTE：本会话 + 全部后代子代理会话。深度上限 8 纯属防御（实测子代理只有一层）；
+  // UNION（非 UNION ALL）自带去重，parent_id 链即使异常成环也能终止。
+  const TREE = `WITH RECURSIVE tree(id, d) AS (
+      SELECT '${SID}', 0
+      UNION
+      SELECT s.id, tree.d + 1 FROM session s JOIN tree ON s.parent_id = tree.id WHERE tree.d < 8
+    )`;
   const docs = await querySql(dbPath, [
     // 0 会话信息
     `SELECT id, title, directory, time_created, time_updated
        FROM session WHERE id='${SID}'`,
-    // 1 主轮模型请求聚合（含重试的真实消耗；completed 才有 usage）
+    // 1 主轮计数（轮/步/重试 = 用户消息触发的轮与主循环的模型请求；子代理没有用户轮，
+    //   不计入——它们的量在语句 5 的会话树聚合里单独给）
     `SELECT COUNT(DISTINCT parent_user_message_id) AS turns,
             COUNT(DISTINCT logical_request_id) AS steps,
             COUNT(*) AS attempts,
-            SUM(status='running') AS running_now,
-            SUM(CASE WHEN status='running' THEN 1 ELSE 0 END) AS running_rows,
-            COALESCE(MIN(CASE WHEN status='running' THEN started_at END),0) AS live_since,
-            COALESCE(SUM(CASE WHEN status='completed' THEN duration_ms END),0) AS llm_ms,
-            COALESCE(SUM(CASE WHEN status='completed' THEN input_tokens END),0) AS m_in,
-            COALESCE(SUM(CASE WHEN status='completed' THEN output_tokens END),0) AS m_out,
-            COALESCE(SUM(CASE WHEN status='completed' THEN cache_read_input_tokens END),0) AS m_cread,
-            COALESCE(SUM(CASE WHEN status='completed' THEN cache_creation_input_tokens END),0) AS m_cwrite,
-            COALESCE(SUM(CASE WHEN status='completed' THEN time_to_first_token_ms END),0) AS ttft_sum,
-            SUM(CASE WHEN status='completed' AND time_to_first_token_ms IS NOT NULL THEN 1 ELSE 0 END) AS ttft_n,
             MAX(started_at) AS last_started_at
        FROM model_usage WHERE session_id='${SID}' AND query_source='main_turn'`,
     // 2 最近一次请求（上下文占用 + 当前模型：模型 + provider 用于查上下文窗口）
@@ -496,10 +503,13 @@ export async function computeSessionStats(opts = {}) {
        FROM model_usage
       WHERE session_id='${SID}' AND query_source='main_turn' AND status='completed'
       ORDER BY started_at DESC LIMIT 1`,
-    // 3 工具调用聚合（用时只统计已完成的调用）
-    `SELECT COUNT(*) AS tool_calls, COALESCE(SUM(status='error'),0) AS tool_errors,
-            COALESCE(SUM(CASE WHEN status='completed' THEN duration_ms END),0) AS tool_ms
-       FROM tool_usage WHERE session_id='${SID}'`,
+    // 3 工具调用聚合（会话树口径：含子代理执行的工具；用时只统计已完成的调用）
+    `${TREE}
+     SELECT COUNT(*) AS tool_calls, COALESCE(SUM(status='error'),0) AS tool_errors,
+            COALESCE(SUM(CASE WHEN status='completed' THEN duration_ms END),0) AS tool_ms,
+            SUM(CASE WHEN session_id <> '${SID}' THEN 1 ELSE 0 END) AS sub_tool_calls,
+            COALESCE(SUM(CASE WHEN session_id <> '${SID}' AND status='completed' THEN duration_ms END),0) AS sub_tool_ms
+       FROM tool_usage WHERE session_id IN (SELECT id FROM tree)`,
     // 4 最近轮列表（按所属用户消息聚合；进行中的轮也展示）
     `SELECT parent_user_message_id AS msg_id,
             MIN(turn_id) AS turn_id,
@@ -516,27 +526,68 @@ export async function computeSessionStats(opts = {}) {
       WHERE session_id='${SID}' AND query_source='main_turn' AND parent_user_message_id IS NOT NULL
       GROUP BY parent_user_message_id
       ORDER BY started_at DESC LIMIT 6`,
+    // 5 会话树用量聚合（口径核心：token/耗时/TTFT/运行中全部沿树求和，含子代理；同时
+    //   给"子代理独占"一组供 UI 标明构成。一次扫描算完，实测 0.05ms 级。不限定
+    //   query_source —— 会话树里的标题生成、目标校验等辅助请求也是真实消耗）
+    `${TREE}
+     SELECT COALESCE(SUM(CASE WHEN status='completed' THEN input_tokens END),0) AS in_all,
+            COALESCE(SUM(CASE WHEN status='completed' THEN output_tokens END),0) AS out_all,
+            COALESCE(SUM(CASE WHEN status='completed' THEN cache_read_input_tokens END),0) AS cread_all,
+            COALESCE(SUM(CASE WHEN status='completed' THEN cache_creation_input_tokens END),0) AS cwrite_all,
+            COALESCE(SUM(CASE WHEN status='completed' THEN duration_ms END),0) AS llm_all,
+            COALESCE(SUM(CASE WHEN status='completed' THEN time_to_first_token_ms END),0) AS ttft_sum_all,
+            SUM(CASE WHEN status='completed' AND time_to_first_token_ms IS NOT NULL THEN 1 ELSE 0 END) AS ttft_n_all,
+            SUM(status='running') AS running_now,
+            SUM(CASE WHEN status='running' THEN 1 ELSE 0 END) AS running_rows,
+            COALESCE(MIN(CASE WHEN status='running' THEN started_at END),0) AS live_since,
+            SUM(CASE WHEN session_id <> '${SID}' THEN 1 ELSE 0 END) AS sub_requests,
+            COALESCE(SUM(CASE WHEN status='completed' AND session_id <> '${SID}' THEN input_tokens END),0) AS in_sub,
+            COALESCE(SUM(CASE WHEN status='completed' AND session_id <> '${SID}' THEN output_tokens END),0) AS out_sub,
+            COALESCE(SUM(CASE WHEN status='completed' AND session_id <> '${SID}' THEN cache_read_input_tokens END),0) AS cread_sub,
+            COALESCE(SUM(CASE WHEN status='completed' AND session_id <> '${SID}' THEN cache_creation_input_tokens END),0) AS cwrite_sub,
+            COALESCE(SUM(CASE WHEN status='completed' AND session_id <> '${SID}' THEN duration_ms END),0) AS llm_sub,
+            (SELECT COUNT(*) - 1 FROM tree) AS sub_sessions
+       FROM model_usage WHERE session_id IN (SELECT id FROM tree)`,
   ]);
 
-  const [sessRows, aggRows, lastRows, toolRows, turnRows] = docs;
+  const [sessRows, countRows, lastRows, toolRows, turnRows, usageRows] = docs;
   const sess = sessRows?.[0] || null;
-  const a = aggRows?.[0] || {};
+  const c = countRows?.[0] || {}; // 主轮计数（轮/步/重试）
   const last = lastRows?.[0] || null;
-  const tools = toolRows?.[0] || {};
+  const tools = toolRows?.[0] || {}; // 会话树工具聚合
+  const u = usageRows?.[0] || {}; // 会话树用量聚合
 
-  const inputTokens = a.m_in ?? 0;
-  const cacheRead = a.m_cread ?? 0;
-  const cacheWrite = a.m_cwrite ?? 0;
-  const outputTokens = a.m_out ?? 0;
-  const llmMs = a.llm_ms ?? 0;
-  const avgTtftMs = a.ttft_n > 0 ? Math.round(a.ttft_sum / a.ttft_n) : null;
+  // 用量口径 = 整个会话树（含子代理）——回答"这个对话真实花了多少"
+  const inputTokens = u.in_all ?? 0;
+  const cacheRead = u.cread_all ?? 0;
+  const cacheWrite = u.cwrite_all ?? 0;
+  const outputTokens = u.out_all ?? 0;
+  const llmMs = u.llm_all ?? 0;
+  const avgTtftMs = u.ttft_n_all > 0 ? Math.round(u.ttft_sum_all / u.ttft_n_all) : null;
 
-  const genMs = Math.max(1, llmMs - (a.ttft_sum ?? 0));
+  const genMs = Math.max(1, llmMs - (u.ttft_sum_all ?? 0));
   const tokPerSec = outputTokens > 0 ? Math.round((outputTokens * 1000) / genMs) : 0;
   const cacheDenom = inputTokens + cacheWrite;
   const cacheHitPct = cacheDenom > 0 ? Math.round((cacheRead / cacheDenom) * 100) : null;
 
-  const liveRow = (a.running_rows ?? 0) > 0;
+  const liveRow = (u.running_rows ?? 0) > 0;
+
+  // 子代理明细（树内非本会话部分的独占值）：仅存在子会话时给出，供 UI 标明总量构成
+  const subSessions = u.sub_sessions ?? 0;
+  const subagent =
+    subSessions > 0
+      ? {
+          sessions: subSessions,
+          requests: u.sub_requests ?? 0,
+          inputTokens: u.in_sub ?? 0,
+          outputTokens: u.out_sub ?? 0,
+          cacheReadTokens: u.cread_sub ?? 0,
+          cacheWriteTokens: u.cwrite_sub ?? 0,
+          llmMs: u.llm_sub ?? 0,
+          toolCalls: tools.sub_tool_calls ?? 0,
+          toolMs: tools.sub_tool_ms ?? 0,
+        }
+      : null;
 
   // 上下文占用：已用 = 最近一次已完成主轮请求的 input_tokens（含缓存读，即那次请求的
   // 完整提示词规模）；窗口 = 模型配置里的 contextWindow。缺任一项则三个字段都不给，
@@ -548,7 +599,7 @@ export async function computeSessionStats(opts = {}) {
 
   return {
     available: true,
-    version: 1,
+    version: 2, // v2：token/耗时/工具改为会话树口径（含子代理），新增 totals.subagent
     generatedAt: Date.now(),
     session: sess
       ? {
@@ -556,20 +607,20 @@ export async function computeSessionStats(opts = {}) {
           title: sess.title,
           directory: sess.directory,
           startedAt: sess.time_created,
-          lastActiveAt: Math.max(sess.time_updated || 0, a.last_started_at || 0),
+          lastActiveAt: Math.max(sess.time_updated || 0, c.last_started_at || 0),
         }
       : { id: sessionId },
     live: liveRow
       ? {
-          since: a.live_since || Date.now(),
-          runningRequests: a.running_now ?? 0,
+          since: u.live_since || Date.now(),
+          runningRequests: u.running_now ?? 0,
         }
       : null,
     totals: {
-      turns: a.turns ?? 0,
-      steps: a.steps ?? 0,
-      attempts: a.attempts ?? 0,
-      retries: Math.max(0, (a.attempts ?? 0) - (a.steps ?? 0)),
+      turns: c.turns ?? 0,
+      steps: c.steps ?? 0,
+      attempts: c.attempts ?? 0,
+      retries: Math.max(0, (c.attempts ?? 0) - (c.steps ?? 0)),
       toolCalls: tools.tool_calls ?? 0,
       toolErrors: tools.tool_errors ?? 0,
       toolMs: tools.tool_ms || null,
@@ -585,7 +636,8 @@ export async function computeSessionStats(opts = {}) {
       contextWindow,
       contextPercent,
       model: last?.model_id ?? null,
-      lastActivityAt: a.last_started_at ?? sess?.time_updated ?? null,
+      lastActivityAt: c.last_started_at ?? sess?.time_updated ?? null,
+      subagent,
     },
     turns: (turnRows || []).map((r) => ({
       msgId: r.msg_id,

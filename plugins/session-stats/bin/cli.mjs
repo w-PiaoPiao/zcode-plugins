@@ -91,8 +91,17 @@ function pretty(s) {
         } tok`
       : "上下文 —";
   lines.push(
-    `工具调用 ${t.toolCalls} 次（失败 ${t.toolErrors}${t.toolMs != null ? `，用时 ${fmtDur(t.toolMs)}` : ""}）· 请求 ${t.attempts} 次（重试 ${t.retries}）· 模型 ${t.model || "—"} · ${ctx}`
+    `工具调用 ${t.toolCalls} 次（失败 ${t.toolErrors}${t.toolMs != null ? `，用时 ${fmtDur(t.toolMs)}` : ""}）· 主轮请求 ${t.attempts} 次（重试 ${t.retries}）· 模型 ${t.model || "—"} · ${ctx}`
   );
+  // 子代理（Task/Explore 等）是 ZCode 里的独立会话：token/耗时/工具已按会话树计入上面，
+  // 这里标出其中属于子代理的部分，避免总量看起来"对不上"。
+  if (t.subagent) {
+    const subTok =
+      (t.subagent.inputTokens || 0) + (t.subagent.cacheWriteTokens || 0) + (t.subagent.outputTokens || 0);
+    lines.push(
+      `子代理 ${t.subagent.sessions} 个会话 · ${t.subagent.requests} 次请求 · ${fmtTokens(subTok)} tok（已含在以上合计中）`
+    );
+  }
   if (s.turns?.length) {
     lines.push("");
     lines.push("最近轮次：");

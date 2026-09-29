@@ -39,6 +39,13 @@ visible in chat views, independent of the chat layout.
   **点击胶囊弹出详情**——「会话统计」（LLM 用时、工具用时、首 token 平均、输出速度）
   与「Token 用量」（缓存命中、未缓存输入/缓存读取/缓存写入/输出，均为精确 token 数）。
   弹层锚定在触发器上方，点击外部 / Escape 关闭，两个弹层互斥，打开期间随每秒轮询刷新。
+- **Token totals cover subagents (Task/Explore)** — ZCode logs every subagent as its
+  own session, so a session-only query silently drops them. Token, time and tool
+  figures here aggregate the whole session tree (`session.parent_id`), and the
+  dialogs mark how much of the total came from subagents ("其中子代理").
+  **Token 总量覆盖子代理（Task/Explore）**——ZCode 把每个子代理记成独立会话，只按本会话
+  查询会静默漏掉它们。本插件的 token/耗时/工具按整个会话树（`session.parent_id`）聚合，
+  弹层标出其中来自子代理的部分（「其中子代理」）。
 - Green breathing dot on the gauge pill while a turn is running; gray while idle;
   pulsing gray while the local daemon is warming up.
   轮次进行中圆点绿色呼吸，空闲灰色，本地服务未就绪时灰色脉动。
@@ -303,16 +310,18 @@ ZCode 桌面版本来就把每次模型请求写进本地数据库
 
 | 指标 | 口径 |
 |---|---|
-| 轮 | 不同 `parent_user_message_id` 数（用户消息触发的轮） |
-| 步 | 不同 `logical_request_id` 数（智能体循环中的模型请求） |
-| LLM | 已完成请求的 `duration_ms` 总和（含重试，不含工具执行） |
-| 工具 | 已完成工具调用的 `duration_ms` 总和（并行调用按时长求和） |
-| 首 token | 请求级 TTFT 的**平均值**（对齐 DeepSeek 官方「首 token 平均」口径） |
+| **会话树** | 本会话 + 沿 `session.parent_id` 递归出的全部子代理会话。ZCode 把 Task/Explore 等子代理记成**独立会话**（`task_type='subagent_child'`），只按本会话聚合会完全漏掉它们——实测某个跑了 3 个子代理的对话，子代理占真实消耗的 71%~92%，所以 token/耗时/工具一律沿树求和 |
+| 轮 | 不同 `parent_user_message_id` 数（用户消息触发的轮；主会话——子代理没有用户轮） |
+| 步 | 不同 `logical_request_id` 数（主会话智能体循环中的模型请求） |
+| LLM | 已完成请求的 `duration_ms` 总和（含重试与子代理，不含工具执行） |
+| 工具 | 已完成工具调用的 `duration_ms` 总和（含子代理，并行调用按时长求和） |
+| 首 token | 请求级 TTFT 的**平均值**（含子代理，对齐 DeepSeek 官方「首 token 平均」口径） |
 | tok/s | 总输出 ÷（总耗时 − 总 TTFT） |
 | 缓存 | `cache_read / (input + cache_write)`；≥ 99.5% 时显示为 100% |
-| 总量 | 未缓存输入 + 缓存写 + 输出（数据库 pill 展示值；`inputTokens` 本身已含缓存读） |
+| 总量 | 会话树内全部 token = 未缓存输入 + 缓存读 + 缓存写 + 输出（数据库 pill 展示值）。本插件 `inputTokens` 本身已含缓存读，故三项相加即等于官方四项之和，不重复计算 |
+| 子代理 | 树内非本会话部分的独占值（会话数 / 请求数 / token / 工具耗时），弹层「其中子代理」与 `/stats` 中标注，已含在合计里 |
 | 上下文 | 已用 = 最近一次已完成主轮请求的 `input_tokens`（含缓存读）；窗口 = 该模型的 `contextWindow`。悬浮条不再展示（ZCode 输入框自带），数据仍供 `/stats` 输出 |
-| 输入/输出 | 累计 token（输入随轮数增长是正常的——每步都重发上下文） |
+| 输入/输出 | 累计 token（含子代理；输入随轮数增长是正常的——每步都重发上下文） |
 
 #### 性能开销
 

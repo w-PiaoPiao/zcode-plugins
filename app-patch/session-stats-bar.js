@@ -257,8 +257,9 @@ function hasUsage(t) {
       (t.cacheWriteTokens || 0) > 0)
   );
 }
-// 计费总量 = 未缓存输入 + 缓存读 + 缓存写 + 输出
-// （本插件 inputTokens 为含缓存读的总输入，故不含 cacheRead；与官方口径一致）
+// 计费总量 = 官方口径的「未缓存输入 + 缓存读 + 缓存写 + 输出」。本插件 inputTokens 为
+// 含缓存读的总输入，三项相加即等于官方四项之和；自 v2 起 token 口径为整个会话树
+// （含子代理），subagent 字段是该总量的子集（独占部分），不重复计入。
 function billedTotal(t) {
   return (t.inputTokens || 0) + (t.cacheWriteTokens || 0) + (t.outputTokens || 0);
 }
@@ -394,7 +395,7 @@ function render(data) {
   setPillClickable(
     pills.usage,
     usageClickable,
-    `Token 用量：共 ${fmtExact(billedTotal(t))} tok，缓存命中 ${p != null ? p + "%" : "—"}，点击查看详情`
+    `Token 用量：共 ${fmtExact(billedTotal(t))} tok${t.subagent ? "（含子代理）" : ""}，缓存命中 ${p != null ? p + "%" : "—"}，点击查看详情`
   );
   syncOpenDialog();
   setStyle(bar, "display", "");
@@ -434,6 +435,10 @@ function updateDialog() {
       ["首 token 平均（TTFT）", fmtSec(t?.avgTtftMs)],
       ["输出速度（TPS）", t && t.tokPerSec > 0 ? `${t.tokPerSec} tok/s` : "—"],
     ];
+    // 子代理（Task/Explore 等）在 ZCode 里是独立会话，只有沿会话树聚合才看得见
+    if (t && t.subagent) {
+      rows.push(["子代理", `${t.subagent.sessions} 个会话 · ${t.subagent.requests} 次请求`]);
+    }
   } else {
     const total = t ? billedTotal(t) : null;
     const p = t ? cacheHitDisplay(t) : null;
@@ -451,6 +456,10 @@ function updateDialog() {
     // 官方细则：缓存写入为 0 时省略该行
     if (t && (t.cacheWriteTokens || 0) !== 0) {
       rows.push(["缓存写入", `${fmtExact(t.cacheWriteTokens)} tok`]);
+    }
+    // 总量构成：标出其中来自子代理的部分（它们的独立会话在悬浮条外，点不到）
+    if (t && t.subagent) {
+      rows.push(["其中子代理", `${t.subagent.sessions} 个会话 · ${fmtTokens(billedTotal(t.subagent))} tok`]);
     }
   }
   setDialogHtml(`<div class="zcstats-dialog-head">${head}</div>` + dialogRows(rows));
