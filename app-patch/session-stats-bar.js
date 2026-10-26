@@ -48,6 +48,20 @@ const CSS = `
 [data-testid="v4-composer"] {
   margin-bottom: 36px !important;
 }
+/* 应用内模态层打开时让位：创建项目、图片/附件预览等对话框都渲染成
+   [data-slot="dialog-overlay"] + [data-slot="dialog-content"]（portal 到 body，z-50），
+   而本条的 z-index 远高于它们，不让位就会盖住拖放区、按钮并截走点击。
+   用 :has() 让隐藏紧跟对话框挂载（比每秒轮询快一帧），JS 侧同时判定为不可见。 */
+body:has([data-slot="dialog-overlay"]) [data-zcstats-bar],
+body:has([data-slot="dialog-content"]) [data-zcstats-bar],
+body:has(dialog[open]) [data-zcstats-bar],
+body:has([role="dialog"][aria-modal="true"]) [data-zcstats-bar],
+body:has([data-slot="dialog-overlay"]) [data-zcstats-dialog],
+body:has([data-slot="dialog-content"]) [data-zcstats-dialog],
+body:has(dialog[open]) [data-zcstats-dialog],
+body:has([role="dialog"][aria-modal="true"]) [data-zcstats-dialog] {
+  display: none !important;
+}
 [data-zcstats-bar] .zcstats-pill {
   display: inline-flex;
   align-items: center;
@@ -563,15 +577,17 @@ async function fetchStats(sessionId) {
 //   - 设置页是同窗覆盖层（聊天区被 inert 隐藏）→ 隐藏统计条
 //   - 新建对话（draft）无会话 id → 清缓存、不带 session 查询（显示全 0）
 
+// ZCode 0.17 起主会话 id 从 sess_<uuid> 改为 session_<32hex>；旧会话仍留在库里，
+// 两种前缀都必须认，否则新会话会被当成草稿 → 永远查哨兵 id → 界面全 0。
 function looksLikeSessionId(v) {
-  return typeof v === "string" && /^sess_[\w.-]{6,200}$/.test(v);
+  return typeof v === "string" && /^(?:sess|session)_[\w.-]{6,200}$/.test(v);
 }
 
 // 新建对话哨兵：传给 daemon 一个格式合法但必然不存在的会话 id，
 // daemon 对显式会话走"查无数据 → 全 0"分支，从而显示全 0 而非上一个对话的数据
 const DRAFT_SENTINEL = "sess_draft_empty_00000000-0000-0000-0000-000000000000";
 
-// 会话权威信号：conversation 容器上的 data-session-id（sess_* 或 draft）
+// 会话权威信号：conversation 容器上的 data-session-id（sess_* / session_* 或 draft）
 function sessionIdFromDom() {
   const pane = document.querySelector('[data-testid="v4-session-pane-workspace-main"]');
   if (!pane) return null; // 容器不存在 → 无法判定（交给视图门控）
@@ -603,9 +619,24 @@ function sessionIdFromFiber() {
   return null;
 }
 
+// ZCode 的对话框（创建项目、文件夹信任、图片灯箱、附件预览……）共用同一套
+// shadcn 风格 Dialog：content 带 data-slot="dialog-content"，遮罩带
+// data-slot="dialog-overlay"，都是 portal 到 body 的 fixed 层（z-50）。
+// 关闭动画期间节点仍挂在 DOM 上，用 getClientRects 排除 display:none 的残留。
+const MODAL_SELECTOR =
+  '[data-slot="dialog-overlay"],[data-slot="dialog-content"],dialog[open],[role="dialog"][aria-modal="true"]';
+
+function modalOpen() {
+  for (const el of document.querySelectorAll(MODAL_SELECTOR)) {
+    if (el.closest("[data-zcstats-dialog]")) continue; // 自身弹层不算
+    if (el.getClientRects().length > 0) return true;
+  }
+  return false;
+}
+
 // 返回 { visible, sessionId }
 //   visible=false → 不在聊天视图（设置/其他），统计条应隐藏
-//   sessionId      → sess_* 或 null（无会话/新建对话 → 不带 session 查询）
+//   sessionId      → sess_* / session_*（无会话/新建对话 → 草稿哨兵，显示全 0）
 function resolveViewState() {
   // 设置页开着，或聊天区被 inert 覆盖 → 不可见
   if (document.querySelector('[data-testid="settings-page"]')) return { visible: false, sessionId: null };
@@ -679,6 +710,15 @@ async function tick() {
     setStyle(bar, "display", "");
   }
   if (document.hidden) return;
+
+  // 应用内模态层（创建项目、图片/附件预览等）打开 → 让位。
+  // CSS :has() 已即时隐藏；这里再停更、关掉自身弹层，并用内联 display 兜底
+  // （防止选择器随 ZCode 改版失效）。关闭对话框后由 body 观察器立刻恢复。
+  if (modalOpen()) {
+    setStyle(bar, "display", "none");
+    closeDialog();
+    return;
+  }
 
   const view = resolveViewState();
   if (!view.visible) {
@@ -802,6 +842,9 @@ function start() {
   );
 
   setInterval(tick, POLL_MS);
+  // ZCode 的模态层是 portal 到 body 的直接子节点：挂载/卸载即重算一次，
+  // 让「打开→让位 / 关闭→恢复」都不必等下一次 1s 轮询（仅监听直接子节点，开销极小）。
+  new MutationObserver(() => tick()).observe(document.body, { childList: true });
   document.addEventListener("visibilitychange", tick);
   window.addEventListener("resize", () => {
     placeBar();

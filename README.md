@@ -49,11 +49,12 @@ visible in chat views, independent of the chat layout.
 - Green breathing dot on the gauge pill while a turn is running; gray while idle;
   pulsing gray while the local daemon is warming up.
   轮次进行中圆点绿色呼吸，空闲灰色，本地服务未就绪时灰色脉动。
-- View-gated: shows only in chat conversation views (hidden on the settings page and
-  in the update window); a new/draft chat shows all zeros instead of the previous
+- View-gated: shows only in chat conversation views (hidden on the settings page,
+  in the update window, and while any in-app dialog — create project, image/attachment
+  preview — is open); a new/draft chat shows all zeros instead of the previous
   session's data.
-  视图门控：仅在聊天对话视图显示（设置页、更新弹窗中隐藏）；新建对话显示全 0，
-  不残留上一个会话的数据。
+  视图门控：仅在聊天对话视图显示（设置页、更新弹窗，以及创建项目、图片/附件预览等
+  应用内对话框打开时隐藏）；新建对话显示全 0，不残留上一个会话的数据。
 - Follows the ZCode light/dark theme; pills shrink gracefully on narrow windows.
   跟随明暗主题；窄窗口自动收缩。
 - `/stats` slash command renders a detailed stats card in chat.

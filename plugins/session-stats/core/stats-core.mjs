@@ -306,9 +306,12 @@ async function resolveSessionId(dbPath, pointerPath) {
   if (cached && cached.raw === raw && Date.now() - cached.ts < 5000) return cached.sessionId;
   const candidates = [];
   if (pointer?.session_id) candidates.push(pointer.session_id);
-  // sess_subagent% 前缀是 ZCode 当前约定；若上游改名，子代理会话可能被选为“最近活跃”
+  // 子代理会话不能再靠 id 前缀排除（0.17 起子代理也可能是 session_*），按 task_type 判。
+  // COALESCE 兼容历史行 task_type 为 NULL 的情况；这类行按主会话候选保留。
   const docs = await querySql(dbPath, [
-    `SELECT id FROM session WHERE id NOT LIKE 'sess_subagent%' ORDER BY time_updated DESC LIMIT 5`,
+    `SELECT id FROM session
+      WHERE COALESCE(task_type, '') <> 'subagent_child'
+      ORDER BY time_updated DESC LIMIT 5`,
   ]);
   for (const row of docs[0] || []) candidates.push(row.id);
   let resolved = null;

@@ -10,5 +10,8 @@ plugins/session-stats/daemon.log.old
 # 运行时产物（install.sh 部署到 ~/.zcode/session-stats/，不在仓库内）
 # 若从仓库拷贝出源码目录，这些由安装脚本在运行时重新生成
 
+# Windows 分发包产物（由 build-win.sh 生成）
+dist/
+
 # macOS
 .DS_Store
